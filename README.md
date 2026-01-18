@@ -12,7 +12,6 @@ This repo includes a small **hand position detector** built on **MediaPipe Hands
 Create a venv and install deps:
 
 ```bash
-cd /Users/jordanlo/Projects/musicmotion
 python3 -m venv .venv
 source .venv/bin/activate
 python3 -m pip install -r requirements.txt
