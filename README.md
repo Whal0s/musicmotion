@@ -32,7 +32,7 @@ python scripts/webcam_demo.py
 ### Retro UI webcam demo (ASCII banner)
 
 ```bash
-python3 scripts/retro_ui_demo.py --mirror
+python3 scripts/retro_ui_demo.py
 ```
 
 Controls:

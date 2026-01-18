@@ -22,6 +22,11 @@ def main() -> int:
     ap.add_argument("--width", type=int, default=1280, help="Capture width (best effort)")
     ap.add_argument("--height", type=int, default=720, help="Capture height (best effort)")
     ap.add_argument("--max-hands", type=int, default=2, help="Maximum number of hands to detect")
+    ap.add_argument(
+        "--no-mirror",
+        action="store_true",
+        help="Disable horizontal mirroring (default is mirrored/selfie mode)",
+    )
     args = ap.parse_args()
 
     if platform.system() == "Darwin":
@@ -42,6 +47,9 @@ def main() -> int:
             ok, frame = cap.read()
             if not ok:
                 break
+
+            if not args.no_mirror:
+                frame = cv2.flip(frame, 1)
 
             hands = detector.detect(frame)
             frame = detector.draw(frame, hands, draw_landmarks=True)

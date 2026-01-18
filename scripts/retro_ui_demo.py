@@ -16,14 +16,16 @@ if SRC_ROOT not in sys.path:
     sys.path.insert(0, SRC_ROOT)
 
 from musicmotion_hand.detector import HandPositionDetector  # noqa: E402
+from musicmotion_hand.types import HandLandmark, HandPosition  # noqa: E402
 
 
 ASCII_LOGO = [
-    r"                  _                       _   _           ",
-    r" _ __ ___  _   _ | | ___  _ __ ___   ___ | |_(_) ___  _ __ ",
-    r"| '_ ` _ \| | | || |/ __|| '_ ` _ \ / _ \| __| |/ _ \| '_ \\",
-    r"| | | | | | |_| || |\__ \| | | | | | (_) | |_| | (_) | | | |",
-    r"|_| |_| |_|\__,_||_||___/|_| |_| |_|\___/ \__|_|\___/|_| |_|",
+                                                              
+    r"                         _                      _   _         ",
+    r" _ __ ___  _   _ ___(_) ___ _ __ ___   ___ | |_(_) ___  _ __  ",
+    r"| '_ ` _ \| | | / __| |/ __| '_ ` _ \ / _ \| __| |/ _ \| '_ \ ",
+    r"| | | | | | |_| \__ \ | (__| | | | | | (_) | |_| | (_) | | | |",
+    r"|_| |_| |_|\__,_|___/_|\___|_| |_| |_|\___/ \__|_|\___/|_| |_|",
 ]
 
 
@@ -39,8 +41,9 @@ def draw_ascii_banner(canvas_bgr: np.ndarray, title_lines=ASCII_LOGO) -> None:
     scale = 1.15
     thickness = 2
 
-    # Measure block height.
-    line_h = cv2.getTextSize("A", font, scale, thickness)[0][1] + 6
+    # Use fixed-width "cell" placement to preserve ASCII alignment (OpenCV fonts aren't truly monospace).
+    char_w = cv2.getTextSize("M", font, scale, thickness)[0][0]
+    line_h = cv2.getTextSize("A", font, scale, thickness)[0][1] + 8
     block_h = line_h * len(title_lines)
     y0 = max(8, (h - block_h) // 2)
 
@@ -49,10 +52,13 @@ def draw_ascii_banner(canvas_bgr: np.ndarray, title_lines=ASCII_LOGO) -> None:
 
     for i, line in enumerate(title_lines):
         y = y0 + (i + 1) * line_h
-        # Shadow (heavier + offset) for a retro drop-shadow look
-        cv2.putText(canvas_bgr, line, (x0 + 3, y + 3), font, scale, shadow, thickness + 4, cv2.LINE_AA)
-        cv2.putText(canvas_bgr, line, (x0 + 2, y + 2), font, scale, (0, 0, 0), thickness + 2, cv2.LINE_AA)
-        cv2.putText(canvas_bgr, line, (x0, y), font, scale, green, thickness, cv2.LINE_AA)
+        # Draw character-by-character to keep the ASCII art columns aligned.
+        for j, ch in enumerate(line):
+            x = x0 + j * char_w
+            # Shadow (heavier + offset) for a retro drop-shadow look
+            cv2.putText(canvas_bgr, ch, (x + 3, y + 3), font, scale, shadow, thickness + 4, cv2.LINE_AA)
+            cv2.putText(canvas_bgr, ch, (x + 2, y + 2), font, scale, (0, 0, 0), thickness + 2, cv2.LINE_AA)
+            cv2.putText(canvas_bgr, ch, (x, y), font, scale, green, thickness, cv2.LINE_AA)
 
     # Scanlines
     for y in range(0, h, 4):
@@ -68,7 +74,11 @@ def main() -> int:
     ap.add_argument("--width", type=int, default=1280, help="Capture width (best effort)")
     ap.add_argument("--height", type=int, default=720, help="Capture height (best effort)")
     ap.add_argument("--max-hands", type=int, default=2, help="Maximum number of hands to detect")
-    ap.add_argument("--mirror", action="store_true", help="Mirror the camera view (selfie mode)")
+    ap.add_argument(
+        "--no-mirror",
+        action="store_true",
+        help="Disable horizontal mirroring (default is mirrored/selfie mode)",
+    )
     ap.add_argument("--banner-height", type=int, default=92, help="Top strip height in pixels")
     ap.add_argument(
         "--tasks-model",
@@ -112,11 +122,19 @@ def main() -> int:
             if not ok:
                 break
 
-            if args.mirror:
-                frame = cv2.flip(frame, 1)
-
+            # Detect on the raw (unmirrored) frame so handedness labels remain correct.
             hands = detector.detect(frame)
-            frame = detector.draw(frame, hands, draw_landmarks=True)
+
+            # Prepare display frame. If mirroring, mirror coordinates too (so overlay lines up).
+            if not args.no_mirror:
+                display = cv2.flip(frame, 1)
+                fh, fw = frame.shape[:2]
+                hands_to_draw = _mirror_hands(hands, width_px=fw)
+            else:
+                display = frame
+                hands_to_draw = hands
+
+            display = detector.draw(display, hands_to_draw, draw_landmarks=True)
 
             # FPS (simple exponential smoothing)
             now = time.time()
@@ -126,7 +144,7 @@ def main() -> int:
             last_t = now
 
             # Resize banner to current frame width (camera may not match requested width).
-            fh, fw = frame.shape[:2]
+            fh, fw = display.shape[:2]
             if banner.shape[1] != fw:
                 banner = np.zeros((args.banner_height, fw, 3), dtype=np.uint8)
                 draw_ascii_banner(banner)
@@ -145,7 +163,7 @@ def main() -> int:
 
             out = np.zeros((hud.shape[0] + fh, fw, 3), dtype=np.uint8)
             out[: hud.shape[0], :, :] = hud
-            out[hud.shape[0] :, :, :] = frame
+            out[hud.shape[0] :, :, :] = display
 
             cv2.imshow(window_name, out)
             key = cv2.waitKey(1) & 0xFF
@@ -157,7 +175,49 @@ def main() -> int:
     return 0
 
 
+def _mirror_hands(hands: list[HandPosition], *, width_px: int) -> list[HandPosition]:
+    """
+    Mirror HandPosition coordinates horizontally for drawing on a horizontally flipped frame.
+
+    This keeps handedness labels untouched while making points/lines line up with the mirrored image.
+    """
+
+    out: list[HandPosition] = []
+    for hand in hands:
+        lms: list[HandLandmark] = []
+        for lm in hand.landmarks:
+            x_px = int(width_px - 1 - lm.x_px)
+            lms.append(
+                HandLandmark(
+                    idx=lm.idx,
+                    x_norm=1.0 - lm.x_norm,
+                    y_norm=lm.y_norm,
+                    z_norm=lm.z_norm,
+                    x_px=x_px,
+                    y_px=lm.y_px,
+                )
+            )
+
+        x0, y0, x1, y1 = hand.bbox_px
+        bbox = (int(width_px - 1 - x1), y0, int(width_px - 1 - x0), y1)
+        cx, cy = hand.center_px
+        center = (int(width_px - 1 - cx), cy)
+        tips = {k: (int(width_px - 1 - v[0]), v[1]) for k, v in hand.fingertips_px.items()}
+
+        out.append(
+            HandPosition(
+                handedness_label=hand.handedness_label,
+                handedness_score=hand.handedness_score,
+                landmarks=lms,
+                bbox_px=bbox,
+                center_px=center,
+                fingertips_px=tips,
+            )
+        )
+
+    return out
+
+
 if __name__ == "__main__":
     raise SystemExit(main())
-
 
