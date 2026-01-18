@@ -315,6 +315,14 @@ def _left_hand(hands: List[HandPosition]) -> Optional[HandPosition]:
     return None
 
 
+def _right_hand_strict(hands: List[HandPosition]) -> Optional[HandPosition]:
+    """Return the hand labeled Right only (no fallback)."""
+    for h in hands:
+        if (h.handedness_label or "").lower() == "right":
+            return h
+    return None
+
+
 def _midi_to_hz(midi: int) -> float:
     return 440.0 * (2.0 ** ((float(midi) - 69.0) / 12.0))
 
@@ -945,6 +953,7 @@ def main() -> int:
     loop_start_t: Optional[float] = None
     instruments = ["keys", "kit", "bass", "lead"]
     instrument_idx = 0
+    chord_slot_state = 3  # persistent chord selection (0..6); prevents jumping when R is missing
 
     metro = Metronome(sample_rate=48000, channels=2)
     metro_running = False
@@ -967,8 +976,11 @@ def main() -> int:
                 display = frame
                 hands = hands_raw
 
-            # Choose control hands (right hand drives setup; left hand will drive instrument selection).
+            # Choose control hands.
+            # - `rh` drives setup (may fall back)
+            # - `rh_strict` drives chord selection ONLY (no fallback; prevents left-hand affecting pitch)
             rh = _right_hand(hands)
+            rh_strict = _right_hand_strict(hands)
             lh = _left_hand(hands)
 
             # Update fps
@@ -1199,18 +1211,27 @@ def main() -> int:
                 _draw_instrument_panel(display, instr_rect, instruments, selected_idx=instrument_idx)
 
                 # Chord ruler (Keys only): to the left of the right info panel
+                # IMPORTANT: chord selection (degree/pitch) is driven ONLY by the RIGHT hand.
                 chords = _degree_chords(mode)
+                # Display tonic at the bottom by reversing the list for the ruler.
+                chords_ruler = list(reversed(chords))
                 chord_w = int(max(140, W * 0.14))
-                chord_rect = (info_rect[0] - pad - chord_w, top, info_rect[0] - pad, bottom)
-                chord_idx = 0
-                if rh is not None:
-                    cy = rh.center_px[1]
+                # Shrink vertical reach so it's easier to hit top/bottom without extreme hand travel.
+                mid_h = max(1, bottom - top)
+                chord_y0 = top + int(mid_h * 0.12)
+                chord_y1 = bottom - int(mid_h * 0.16)
+                chord_rect = (info_rect[0] - pad - chord_w, chord_y0, info_rect[0] - pad, chord_y1)
+                chord_slot = chord_slot_state  # keep last known
+                if rh_strict is not None:
+                    cy = rh_strict.center_px[1]
                     inner_y0 = chord_rect[1] + 44
                     inner_y1 = chord_rect[3] - 10
-                    t = float(np.clip((cy - inner_y0) / max(1.0, (inner_y1 - inner_y0)), 0.0, 0.999))
-                    chord_idx = int(t * 7)
+                    # Natural mapping: hand up => selection up (toward the top of the ruler).
+                    t = float(np.clip((cy - inner_y0) / max(1.0, (inner_y1 - inner_y0)), 0.0, 0.999999))
+                    chord_slot = min(6, int(t * 7))
+                    chord_slot_state = chord_slot
                 if instrument_idx == 0:
-                    _draw_chord_ruler(display, chord_rect, chords, chord_idx)
+                    _draw_chord_ruler(display, chord_rect, chords_ruler, chord_slot)
 
                 # Left hand controls instrument selection (point UP/DOWN)
                 if lh is not None:
@@ -1229,7 +1250,7 @@ def main() -> int:
                 if instrument_idx == 0 and state == "loop" and lh is not None and KEYS_ENABLED:
                     left_closed = _hand_openness_score(lh) <= 0.06
                     if left_fist_gate.rising_edge(left_closed, cooldown_s=0.18):
-                        _, _lb, midi_notes = chords[chord_idx]
+                        _, _lb, midi_notes = chords_ruler[chord_slot]
                         freqs = [_midi_to_hz(m) for m in midi_notes]
                         if metro_running:
                             metro.play_chord(freqs)
