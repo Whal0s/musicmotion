@@ -38,7 +38,7 @@ python3 scripts/retro_ui_demo.py
 Controls:
 - `q`: quit
 
-### Title screen (hand-controlled BPM + key mode)
+### Title screen (hand-controlled BPM + key mode) MAIN SCRIPT
 
 ```bash
 python3 scripts/title_screen.py
