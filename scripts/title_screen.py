@@ -788,7 +788,7 @@ def main() -> int:
     welcome_start_t: float = time.time()
     countdown_start_t: Optional[float] = None
     loop_start_t: Optional[float] = None
-    instruments = ["keys", "bass", "kit", "lead"]
+    instruments = ["keys", "kit", "bass", "lead"]
     instrument_idx = 0
 
     metro = Metronome(sample_rate=48000, channels=2)
