@@ -56,13 +56,25 @@ KEYS_VIBRATO_HEIGHT_PX_FOR_MAX = 140.0
 BASS_ENABLED = True
 BASS_VOLUME = 0.18  # 0..1
 BASS_ATTACK_MS = 6.0
-BASS_DECAY_MS = 380.0
+BASS_DECAY_MS = 580.0
 BASS_DURATION_MS = 520.0
 BASS_SUB_MIX = 0.35  # 0..1 (adds a sine an octave down)
 # More "real synth" tone controls
 BASS_HARMONICS = 12
 BASS_LPF_HZ = 650.0
-BASS_DRIVE = 1.4  # >1 adds saturation
+BASS_DRIVE = 1.8  # >1 adds saturation
+
+# --- Lead synth knobs ---
+LEAD_ENABLED = True
+LEAD_VOLUME = 0.14  # 0..1
+LEAD_ATTACK_MS = 3.0
+LEAD_DECAY_MS = 860.0
+LEAD_DURATION_MS = 380.0
+LEAD_HARMONICS = 18
+LEAD_LPF_HZ = 3200.0
+LEAD_DRIVE = 1.15
+LEAD_HOLD_CLOSE_TH = 0.06
+LEAD_HOLD_OPEN_TH = 0.16
 
 # --- Kit (drums) synth knobs ---
 KIT_ENABLED = True
@@ -70,10 +82,10 @@ KIT_KICK_VOLUME = 0.22  # 0..1
 KIT_SNARE_VOLUME = 0.16  # 0..1
 KIT_TRIGGER_CLOSE_TH = 0.05
 KIT_TRIGGER_OPEN_TH = 0.12
-KIT_TRIGGER_COOLDOWN_S = 0.12
+KIT_TRIGGER_COOLDOWN_S = 0.6
 
 # Less-retro drum tone controls
-KICK_DRIVE = 1.6
+KICK_DRIVE = 2.0
 SNARE_HP_HZ = 700.0
 SNARE_LP_HZ = 6500.0
 SNARE_TONE_HZ = 190.0
@@ -106,6 +118,8 @@ class Metronome:
         self._sustain: List["_SustainChordVoice"] = []
         self._drums: List["_DrumVoice"] = []
         self._bass: List["_BassVoice"] = []
+        self._lead: List["_LeadVoice"] = []
+        self._lead_sustain: List["_SustainLeadVoice"] = []
         self._vib_phase = 0.0
         self._live_vibrato_cents = 0.0
         self._lock = threading.Lock()
@@ -197,6 +211,17 @@ class Metronome:
                                 self._sustain[-1].release()
                         elif kind == "bass":
                             self._bass.append(_BassVoice.create(float(payload), self.sample_rate))
+                        elif kind == "lead":
+                            self._lead.append(_LeadVoice.create(float(payload), self.sample_rate))
+                        elif kind == "lead_on":
+                            self._lead_sustain.append(_SustainLeadVoice.create(float(payload), self.sample_rate))
+                        elif kind == "lead_off":
+                            if self._lead_sustain:
+                                # release the most recent non-released voice
+                                for v in reversed(self._lead_sustain):
+                                    if not v.releasing and not v.done:
+                                        v.release()
+                                        break
                         elif kind == "kick":
                             self._drums.append(_KickVoice.create(self.sample_rate))
                         elif kind == "snare":
@@ -221,6 +246,20 @@ class Metronome:
                     freq = float(payload)
                     if freq > 0:
                         self._bass.append(_BassVoice.create(freq, self.sample_rate))
+                elif kind == "lead":
+                    freq = float(payload)
+                    if freq > 0:
+                        self._lead.append(_LeadVoice.create(freq, self.sample_rate))
+                elif kind == "lead_on":
+                    freq = float(payload)
+                    if freq > 0:
+                        self._lead_sustain.append(_SustainLeadVoice.create(freq, self.sample_rate))
+                elif kind == "lead_off":
+                    if self._lead_sustain:
+                        for v in reversed(self._lead_sustain):
+                            if not v.releasing and not v.done:
+                                v.release()
+                                break
                 elif kind == "kick":
                     self._drums.append(_KickVoice.create(self.sample_rate))
                 elif kind == "snare":
@@ -286,6 +325,36 @@ class Metronome:
                     keep_b.append(v)
             self._bass = keep_b
 
+        # Lead synthesis
+        if LEAD_ENABLED and LEAD_VOLUME > 0 and self._lead:
+            t_idx = np.arange(frames, dtype=np.float64)
+            keep_l: List[_LeadVoice] = []
+            for v in self._lead:
+                y = v.render(t_idx)
+                if y is not None:
+                    yy = (y.astype(np.float32) * float(LEAD_VOLUME)).reshape(-1, 1)
+                    out[:, :1] += yy
+                    if self.channels > 1:
+                        out[:, 1:2] += yy
+                if not v.done:
+                    keep_l.append(v)
+            self._lead = keep_l
+
+        # Sustained lead synthesis (hold-to-sustain)
+        if LEAD_ENABLED and LEAD_VOLUME > 0 and self._lead_sustain:
+            t_idx = np.arange(frames, dtype=np.float64)
+            keep_ls: List[_SustainLeadVoice] = []
+            for v in self._lead_sustain:
+                y = v.render(t_idx)
+                if y is not None:
+                    yy = (y.astype(np.float32) * float(LEAD_VOLUME)).reshape(-1, 1)
+                    out[:, :1] += yy
+                    if self.channels > 1:
+                        out[:, 1:2] += yy
+                if not v.done:
+                    keep_ls.append(v)
+            self._lead_sustain = keep_ls
+
         # Drum events + synthesis (independent of KEYS)
         if KIT_ENABLED and (KIT_KICK_VOLUME > 0 or KIT_SNARE_VOLUME > 0):
             if self._drums:
@@ -337,6 +406,15 @@ class Metronome:
 
     def play_bass(self, freq_hz: float) -> None:
         self._events.put(("bass", float(freq_hz)))
+
+    def play_lead(self, freq_hz: float) -> None:
+        self._events.put(("lead", float(freq_hz)))
+
+    def start_hold_lead(self, freq_hz: float) -> None:
+        self._events.put(("lead_on", float(freq_hz)))
+
+    def stop_hold_lead(self) -> None:
+        self._events.put(("lead_off", None))
 
     def play_kick(self) -> None:
         self._events.put(("kick", None))
@@ -635,6 +713,152 @@ class _BassVoice:
             out = np.zeros((t_idx.size,), dtype=np.float64)
             out[:n] = y
             return out
+        return y
+
+
+@dataclass
+class _LeadVoice:
+    freq: float
+    phase: float
+    pos: int
+    length: int
+    attack: int
+    decay: int
+    sample_rate: int
+    done: bool = False
+
+    @staticmethod
+    def create(freq: float, sample_rate: int) -> "_LeadVoice":
+        length = max(1, int(sample_rate * (LEAD_DURATION_MS / 1000.0)))
+        attack = max(1, int(sample_rate * (LEAD_ATTACK_MS / 1000.0)))
+        decay = max(1, int(sample_rate * (LEAD_DECAY_MS / 1000.0)))
+        return _LeadVoice(
+            freq=float(freq),
+            phase=float(np.random.rand() * 2.0 * np.pi),
+            pos=0,
+            length=length,
+            attack=attack,
+            decay=decay,
+            sample_rate=sample_rate,
+        )
+
+    def render(self, t_idx: np.ndarray) -> Optional[np.ndarray]:
+        if self.done:
+            return None
+        remaining = self.length - self.pos
+        if remaining <= 0:
+            self.done = True
+            return None
+
+        n = int(min(t_idx.size, remaining))
+        tt = t_idx[:n]
+        inc = (2.0 * np.pi * float(self.freq)) / float(self.sample_rate)
+        phase = self.phase + inc * tt
+
+        H = int(max(1, min(48, int(LEAD_HARMONICS))))
+        saw = np.zeros(n, dtype=np.float64)
+        for k in range(1, H + 1):
+            saw += np.sin(phase * float(k)) / float(k)
+        saw *= (2.0 / np.pi)
+        # Classic sawtooth-ish tone (harmonic sum). Keep it relatively "clean";
+        # drive/saturation happens later.
+        wave = saw
+
+        s = (self.pos + tt).astype(np.float64)
+        env_attack = np.clip(s / float(self.attack), 0.0, 1.0)
+        env_decay = np.exp(-s / float(self.decay))
+        env = env_attack * env_decay
+        y = wave * env
+
+        a = np.exp(-2.0 * np.pi * float(LEAD_LPF_HZ) / float(self.sample_rate))
+        ylp = 0.0
+        for i in range(n):
+            ylp = (a * ylp) + ((1.0 - a) * y[i])
+            y[i] = ylp
+
+        y = np.tanh(y * float(LEAD_DRIVE))
+
+        self.phase = float((self.phase + inc * float(n)) % (2.0 * np.pi))
+        self.pos += n
+        if self.pos >= self.length:
+            self.done = True
+
+        if n < t_idx.size:
+            out = np.zeros((t_idx.size,), dtype=np.float64)
+            out[:n] = y
+            return out
+        return y
+
+
+@dataclass
+class _SustainLeadVoice:
+    freq: float
+    phase: float
+    pos: int
+    attack: int
+    release_samps: int
+    sample_rate: int
+    releasing: bool = False
+    release_pos: int = 0
+    done: bool = False
+
+    @staticmethod
+    def create(freq: float, sample_rate: int) -> "_SustainLeadVoice":
+        attack = max(1, int(sample_rate * (LEAD_ATTACK_MS / 1000.0)))
+        release_samps = max(1, int(sample_rate * 0.10))
+        return _SustainLeadVoice(
+            freq=float(freq),
+            phase=float(np.random.rand() * 2.0 * np.pi),
+            pos=0,
+            attack=attack,
+            release_samps=release_samps,
+            sample_rate=sample_rate,
+        )
+
+    def release(self) -> None:
+        if not self.releasing:
+            self.releasing = True
+            self.release_pos = 0
+
+    def render(self, t_idx: np.ndarray) -> Optional[np.ndarray]:
+        if self.done:
+            return None
+
+        n = int(t_idx.size)
+        inc = (2.0 * np.pi * float(self.freq)) / float(self.sample_rate)
+        phase = self.phase + inc * t_idx
+
+        # Sawtooth-ish harmonic sum
+        H = int(max(1, min(48, int(LEAD_HARMONICS))))
+        saw = np.zeros(n, dtype=np.float64)
+        for k in range(1, H + 1):
+            saw += np.sin(phase * float(k)) / float(k)
+        saw *= (2.0 / np.pi)
+        y = saw
+
+        # attack to full level, then sustain until released
+        s = (self.pos + t_idx).astype(np.float64)
+        env = np.clip(s / float(self.attack), 0.0, 1.0)
+
+        if self.releasing:
+            r = np.clip(1.0 - (self.release_pos + t_idx) / float(self.release_samps), 0.0, 1.0)
+            env = env * r
+            self.release_pos += n
+            if self.release_pos >= self.release_samps:
+                self.done = True
+
+        y = y * env
+
+        # filter + drive to match lead character
+        a = np.exp(-2.0 * np.pi * float(LEAD_LPF_HZ) / float(self.sample_rate))
+        ylp = 0.0
+        for i in range(n):
+            ylp = (a * ylp) + ((1.0 - a) * y[i])
+            y[i] = ylp
+        y = np.tanh(y * float(LEAD_DRIVE))
+
+        self.phase = float((self.phase + inc * float(n)) % (2.0 * np.pi))
+        self.pos += n
         return y
 
 ASCII_LOGO = [
@@ -1392,6 +1616,8 @@ def main() -> int:
     keys_hold_gate = ClenchGate()
     keys_holding = False
     keys_baseline_y: Optional[int] = None
+    lead_hold_gate = ClenchGate()
+    lead_holding = False
     last_t = time.time()
     fps = 0.0
     particles: List[Particle] = []
@@ -1686,7 +1912,7 @@ def main() -> int:
                     t = float(np.clip((cy - inner_y0) / max(1.0, (inner_y1 - inner_y0)), 0.0, 0.999999))
                     chord_slot = min(6, int(t * 7))
                     chord_slot_state = chord_slot
-                if active_instr in (0, 2):
+                if active_instr in (0, 2, 3):
                     _draw_chord_ruler(display, chord_rect, chords_ruler, chord_slot)
 
                 # Left hand controls instrument selection (point UP/DOWN)
@@ -1751,21 +1977,61 @@ def main() -> int:
                         metro.stop_hold_chord()
                     keys_hold_gate.is_closed = False
 
-                # Bass trigger: same gesture + same ruler, but plays root note as bass (loop only)
-                if active_instr == 2 and state == "loop" and lh is not None and BASS_ENABLED:
-                    left_closed = _hand_openness_score(lh) <= 0.06
-                    if left_fist_gate.rising_edge(left_closed, cooldown_s=0.18):
-                        _rn, _lb, midi_notes = chords_ruler[chord_slot]
-                        root = int(midi_notes[0]) - 24  # drop 2 octaves
-                        root = int(np.clip(root, 24, 72))
-                        if metro_running:
+                # Bass + Lead triggers share the same clench edge gate (loop only).
+                # Bass: chord root dropped 2 octaves. Lead: same selection but +2 octaves relative to bass.
+                if state == "loop" and metro_running:
+                    # Bass trigger: edge-triggered, one-shot
+                    if active_instr == 2 and BASS_ENABLED and lh is not None:
+                        left_closed = _hand_openness_score(lh) <= 0.06
+                        if left_fist_gate.rising_edge(left_closed, cooldown_s=0.18):
+                            _rn, _lb, midi_notes = chords_ruler[chord_slot]
+                            root = int(midi_notes[0]) - 24  # drop 2 octaves
+                            root = int(np.clip(root, 24, 72))
                             hz = _midi_to_hz(root)
                             metro.play_bass(hz)
                             current_layer.append((metro.current_sample(), "bass", float(hz)))
-                else:
-                    # don't clobber the gate if keys is active; only reset if neither uses it
-                    if active_instr not in (0, 2):
-                        left_fist_gate.prev = False
+
+                    # Lead: hold-to-sustain (close starts, open releases)
+                    if active_instr == 3 and LEAD_ENABLED:
+                        if lh is not None:
+                            l_val = float(_hand_openness_score(lh))
+                            fired = lead_hold_gate.update_and_fire(
+                                l_val,
+                                close_th=LEAD_HOLD_CLOSE_TH,
+                                open_th=LEAD_HOLD_OPEN_TH,
+                                cooldown_s=0.08,
+                            )
+                            if fired:
+                                lead_holding = True
+                                _rn, _lb, midi_notes = chords_ruler[chord_slot]
+                                lead_midi = int(midi_notes[0]) + 12  # one octave above chord root
+                                lead_midi = int(np.clip(lead_midi, 36, 96))
+                                hz = _midi_to_hz(lead_midi)
+                                metro.start_hold_lead(hz)
+                                current_layer.append((metro.current_sample(), "lead_on", float(hz)))
+
+                            if lead_holding and (l_val >= LEAD_HOLD_OPEN_TH):
+                                lead_holding = False
+                                metro.stop_hold_lead()
+                                current_layer.append((metro.current_sample(), "lead_off", None))
+                        else:
+                            # if left hand disappears, stop sustained lead (avoid stuck note)
+                            if lead_holding:
+                                lead_holding = False
+                                metro.stop_hold_lead()
+                                current_layer.append((metro.current_sample(), "lead_off", None))
+                            lead_hold_gate.is_closed = False
+
+                # Reset shared bass edge-gate when we're not on Bass.
+                if active_instr != 2:
+                    left_fist_gate.prev = False
+                # If we leave Lead, ensure sustain is released and gate reset.
+                if active_instr != 3:
+                    if lead_holding and state == "loop" and metro_running:
+                        lead_holding = False
+                        metro.stop_hold_lead()
+                        current_layer.append((metro.current_sample(), "lead_off", None))
+                    lead_hold_gate.is_closed = False
 
                 # Kit triggers (loop only):
                 # - left hand close => kick
