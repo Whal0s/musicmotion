@@ -58,6 +58,9 @@ def main() -> int:
         help="Volume level (0.0 to 1.0, default: 0.3)",
     )
     args = ap.parse_args()
+    
+    # Default position when no hand is detected (middle of scale)
+    DEFAULT_POSITION = 0.5
 
     if platform.system() == "Darwin":
         cap = cv2.VideoCapture(args.camera, cv2.CAP_AVFOUNDATION)
@@ -117,10 +120,10 @@ def main() -> int:
                         cv2.LINE_AA,
                     )
                 else:
-                    tone_gen.set_position(0.5, active=False)
+                    tone_gen.set_position(DEFAULT_POSITION, active=False)
             else:
                 # No right hand detected - silence
-                tone_gen.set_position(0.5, active=False)
+                tone_gen.set_position(DEFAULT_POSITION, active=False)
                 cv2.putText(
                     frame,
                     "No right hand detected",
