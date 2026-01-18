@@ -99,7 +99,15 @@ class ToneGenerator:
                 self._current_frequency = midi_to_freq(midi_note)
 
     def _audio_callback(self, outdata, frames, time_info, status) -> None:
-        """Audio callback for sounddevice stream."""
+        """
+        Audio callback for sounddevice stream.
+        
+        Args:
+            outdata: Output buffer to fill with audio samples
+            frames: Number of frames to generate
+            time_info: Timing information from the audio system
+            status: Stream status flags indicating errors or warnings
+        """
         with self._lock:
             if not self._is_active or self._current_frequency <= 0:
                 outdata[:] = 0
@@ -110,8 +118,8 @@ class ToneGenerator:
             wave = self.volume * np.sin(2 * np.pi * self._current_frequency * t)
             outdata[:, 0] = wave.astype(np.float32)
             
-            # Update phase for continuity
-            self._phase += frames
+            # Update phase for continuity (use modulo to prevent overflow)
+            self._phase = (self._phase + frames) % (self.sample_rate * 1000)
 
     def __enter__(self) -> "ToneGenerator":
         self.start()
