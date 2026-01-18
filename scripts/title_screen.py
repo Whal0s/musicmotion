@@ -78,7 +78,7 @@ LEAD_HOLD_OPEN_TH = 0.16
 
 # --- Kit (drums) synth knobs ---
 KIT_ENABLED = True
-KIT_KICK_VOLUME = 0.14  # 0..1
+KIT_KICK_VOLUME = 0.5  # 0..1
 KIT_SNARE_VOLUME = 0.12  # 0..1
 KIT_TRIGGER_CLOSE_TH = 0.05
 KIT_TRIGGER_OPEN_TH = 0.12
@@ -2167,6 +2167,20 @@ def main() -> int:
                             loop_layers.append(current_layer)
                             metro.set_loop_layers(loop_layers)
                             current_layer = []
+                        # Hard-stop any sustained voices at the segment boundary so nothing can hang
+                        # into the next countdown if a hand remains clenched.
+                        if keys_holding:
+                            keys_holding = False
+                            keys_baseline_y = None
+                            metro.set_live_vibrato_cents(0.0)
+                            metro.stop_hold_chord()
+                        keys_hold_gate.is_closed = False
+
+                        if lead_holding:
+                            lead_holding = False
+                            metro.stop_hold_lead()
+                        lead_hold_gate.is_closed = False
+
                         metro.set_playback_enabled(False)
                         if METRONOME_ENABLED:
                             metro.reset_phase()
