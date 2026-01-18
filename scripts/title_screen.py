@@ -54,15 +54,15 @@ KEYS_VIBRATO_HEIGHT_PX_FOR_MAX = 140.0
 
 # --- Bass synth knobs ---
 BASS_ENABLED = True
-BASS_VOLUME = 0.18  # 0..1
+BASS_VOLUME = 0.12  # 0..1
 BASS_ATTACK_MS = 6.0
 BASS_DECAY_MS = 580.0
 BASS_DURATION_MS = 520.0
-BASS_SUB_MIX = 0.35  # 0..1 (adds a sine an octave down)
+BASS_SUB_MIX = 0.05  # 0..1 (adds a sine an octave down)
 # More "real synth" tone controls
-BASS_HARMONICS = 12
+BASS_HARMONICS = 10
 BASS_LPF_HZ = 650.0
-BASS_DRIVE = 1.8  # >1 adds saturation
+BASS_DRIVE = 1.25  # >1 adds saturation
 
 # --- Lead synth knobs ---
 LEAD_ENABLED = True
@@ -78,14 +78,15 @@ LEAD_HOLD_OPEN_TH = 0.16
 
 # --- Kit (drums) synth knobs ---
 KIT_ENABLED = True
-KIT_KICK_VOLUME = 0.22  # 0..1
-KIT_SNARE_VOLUME = 0.16  # 0..1
+KIT_KICK_VOLUME = 0.14  # 0..1
+KIT_SNARE_VOLUME = 0.12  # 0..1
 KIT_TRIGGER_CLOSE_TH = 0.05
 KIT_TRIGGER_OPEN_TH = 0.12
 KIT_TRIGGER_COOLDOWN_S = 0.6
 
 # Less-retro drum tone controls
-KICK_DRIVE = 2.0
+KICK_DRIVE = 1.25
+KICK_CLICK_LEVEL = 0.035
 SNARE_HP_HZ = 700.0
 SNARE_LP_HZ = 6500.0
 SNARE_TONE_HZ = 190.0
@@ -560,11 +561,13 @@ class _DrumVoice:
 
 @dataclass
 class _KickVoice(_DrumVoice):
+    phase: float = 0.0
+
     @staticmethod
     def create(sample_rate: int) -> "_KickVoice":
-        # Deeper kick: low pitch drop + longer body + tiny click.
-        length = max(1, int(sample_rate * 0.28))
-        return _KickVoice(pos=0, length=length, sample_rate=sample_rate)
+        # Punchier kick: shorter body + quicker drop + transient.
+        length = max(1, int(sample_rate * 0.24))
+        return _KickVoice(pos=0, length=length, sample_rate=sample_rate, phase=0.0)
 
     def render(self, t_idx: np.ndarray) -> Optional[np.ndarray]:
         if self.done:
@@ -575,17 +578,23 @@ class _KickVoice(_DrumVoice):
             return None
         n = int(min(t_idx.size, remaining))
         tt = (self.pos + t_idx[:n]) / float(self.sample_rate)
-        # Exponential pitch drop (deeper)
-        f0, f1 = 85.0, 34.0
-        f = f1 + (f0 - f1) * np.exp(-tt / 0.05)
-        phase = 2.0 * np.pi * np.cumsum(f) / float(self.sample_rate)
-        env = np.exp(-tt / 0.24)
+        # Exponential pitch drop (kick-like attack, deeper tail)
+        f0, f1 = 125.0, 38.0
+        f = f1 + (f0 - f1) * np.exp(-tt / 0.035)
+        # Keep phase continuous across audio blocks (avoids buffer-boundary "buzz/distortion").
+        dphi = (2.0 * np.pi * f) / float(self.sample_rate)
+        phase = self.phase + np.cumsum(dphi)
+        self.phase = float(phase[-1] % (2.0 * np.pi))
+        env = np.exp(-tt / 0.18)
         attack = np.clip(tt / 0.004, 0.0, 1.0)
         body = np.sin(phase) * env * attack
-        sub = np.sin(phase * 0.5) * env * 0.35
+        # less sub sustain so it doesn't read as a bass note
+        sub = np.sin(phase * 0.5) * np.exp(-tt / 0.12) * 0.24
+        # short punch component (beater/thump)
+        punch = np.sin(phase * 2.0) * np.exp(-tt / 0.02) * 0.09
         # tiny click at onset
-        click = (np.random.randn(n) * np.exp(-tt / 0.005) * 0.06)
-        y = body + sub + click
+        click = (np.random.randn(n) * np.exp(-tt / 0.005) * float(KICK_CLICK_LEVEL))
+        y = body + sub + punch + click
         # a touch of saturation for punch
         y = np.tanh(y * float(KICK_DRIVE))
         y = y * float(KIT_KICK_VOLUME)
@@ -658,6 +667,7 @@ class _BassVoice:
     attack: int
     decay: int
     sample_rate: int
+    lpf_state: float = 0.0
     done: bool = False
 
     @staticmethod
@@ -665,7 +675,16 @@ class _BassVoice:
         length = max(1, int(sample_rate * (BASS_DURATION_MS / 1000.0)))
         attack = max(1, int(sample_rate * (BASS_ATTACK_MS / 1000.0)))
         decay = max(1, int(sample_rate * (BASS_DECAY_MS / 1000.0)))
-        return _BassVoice(freq=float(freq), phase=float(np.random.rand() * 2.0 * np.pi), pos=0, length=length, attack=attack, decay=decay, sample_rate=sample_rate)
+        return _BassVoice(
+            freq=float(freq),
+            phase=float(np.random.rand() * 2.0 * np.pi),
+            pos=0,
+            length=length,
+            attack=attack,
+            decay=decay,
+            sample_rate=sample_rate,
+            lpf_state=0.0,
+        )
 
     def render(self, t_idx: np.ndarray) -> Optional[np.ndarray]:
         if self.done:
@@ -703,10 +722,9 @@ class _BassVoice:
         y = wave * env
         # one-pole low-pass for warmth
         a = np.exp(-2.0 * np.pi * float(BASS_LPF_HZ) / float(self.sample_rate))
-        ylp = 0.0
         for i in range(n):
-            ylp = (a * ylp) + ((1.0 - a) * y[i])
-            y[i] = ylp
+            self.lpf_state = (a * self.lpf_state) + ((1.0 - a) * y[i])
+            y[i] = self.lpf_state
         # gentle saturation
         y = np.tanh(y * float(BASS_DRIVE))
         if n < t_idx.size:
@@ -725,6 +743,7 @@ class _LeadVoice:
     attack: int
     decay: int
     sample_rate: int
+    lpf_state: float = 0.0
     done: bool = False
 
     @staticmethod
@@ -740,6 +759,7 @@ class _LeadVoice:
             attack=attack,
             decay=decay,
             sample_rate=sample_rate,
+            lpf_state=0.0,
         )
 
     def render(self, t_idx: np.ndarray) -> Optional[np.ndarray]:
@@ -771,10 +791,9 @@ class _LeadVoice:
         y = wave * env
 
         a = np.exp(-2.0 * np.pi * float(LEAD_LPF_HZ) / float(self.sample_rate))
-        ylp = 0.0
         for i in range(n):
-            ylp = (a * ylp) + ((1.0 - a) * y[i])
-            y[i] = ylp
+            self.lpf_state = (a * self.lpf_state) + ((1.0 - a) * y[i])
+            y[i] = self.lpf_state
 
         y = np.tanh(y * float(LEAD_DRIVE))
 
@@ -798,6 +817,7 @@ class _SustainLeadVoice:
     attack: int
     release_samps: int
     sample_rate: int
+    lpf_state: float = 0.0
     releasing: bool = False
     release_pos: int = 0
     done: bool = False
@@ -813,6 +833,7 @@ class _SustainLeadVoice:
             attack=attack,
             release_samps=release_samps,
             sample_rate=sample_rate,
+            lpf_state=0.0,
         )
 
     def release(self) -> None:
@@ -851,10 +872,9 @@ class _SustainLeadVoice:
 
         # filter + drive to match lead character
         a = np.exp(-2.0 * np.pi * float(LEAD_LPF_HZ) / float(self.sample_rate))
-        ylp = 0.0
         for i in range(n):
-            ylp = (a * ylp) + ((1.0 - a) * y[i])
-            y[i] = ylp
+            self.lpf_state = (a * self.lpf_state) + ((1.0 - a) * y[i])
+            y[i] = self.lpf_state
         y = np.tanh(y * float(LEAD_DRIVE))
 
         self.phase = float((self.phase + inc * float(n)) % (2.0 * np.pi))
@@ -1985,7 +2005,9 @@ def main() -> int:
                         left_closed = _hand_openness_score(lh) <= 0.06
                         if left_fist_gate.rising_edge(left_closed, cooldown_s=0.18):
                             _rn, _lb, midi_notes = chords_ruler[chord_slot]
-                            root = int(midi_notes[0]) - 24  # drop 2 octaves
+                            # Drop bass an extra octave for everything except Bdim (keeps Bdim from getting too muddy/low).
+                            drop = 24 if (_lb == "Bdim") else 36
+                            root = int(midi_notes[0]) - drop
                             root = int(np.clip(root, 24, 72))
                             hz = _midi_to_hz(root)
                             metro.play_bass(hz)
