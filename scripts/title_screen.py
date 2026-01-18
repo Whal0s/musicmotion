@@ -12,6 +12,7 @@ import cv2
 import numpy as np
 import sounddevice as sd
 import queue
+import threading
 
 # Allow running without installing the package (repo-local usage).
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
@@ -45,6 +46,23 @@ KEYS_VOLUME = 0.16  # 0..1
 KEYS_ATTACK_MS = 8.0
 KEYS_DECAY_MS = 650.0
 KEYS_DURATION_MS = 900.0
+KEYS_HOLD_CLOSE_TH = 0.06
+KEYS_HOLD_OPEN_TH = 0.16
+KEYS_VIBRATO_HZ = 6.0
+KEYS_VIBRATO_MAX_CENTS = 35.0
+KEYS_VIBRATO_HEIGHT_PX_FOR_MAX = 140.0
+
+# --- Bass synth knobs ---
+BASS_ENABLED = True
+BASS_VOLUME = 0.18  # 0..1
+BASS_ATTACK_MS = 6.0
+BASS_DECAY_MS = 380.0
+BASS_DURATION_MS = 520.0
+BASS_SUB_MIX = 0.35  # 0..1 (adds a sine an octave down)
+# More "real synth" tone controls
+BASS_HARMONICS = 12
+BASS_LPF_HZ = 650.0
+BASS_DRIVE = 1.4  # >1 adds saturation
 
 # --- Kit (drums) synth knobs ---
 KIT_ENABLED = True
@@ -53,6 +71,12 @@ KIT_SNARE_VOLUME = 0.16  # 0..1
 KIT_TRIGGER_CLOSE_TH = 0.05
 KIT_TRIGGER_OPEN_TH = 0.12
 KIT_TRIGGER_COOLDOWN_S = 0.12
+
+# Less-retro drum tone controls
+KICK_DRIVE = 1.6
+SNARE_HP_HZ = 700.0
+SNARE_LP_HZ = 6500.0
+SNARE_TONE_HZ = 190.0
 
 # --- Instrument selection (left hand) tuning ---
 INSTR_SELECT_STABLE_FRAMES = 6
@@ -79,7 +103,14 @@ class Metronome:
 
         self._events: "queue.SimpleQueue[tuple[str, object]]" = queue.SimpleQueue()
         self._voices: List["_ChordVoice"] = []
+        self._sustain: List["_SustainChordVoice"] = []
         self._drums: List["_DrumVoice"] = []
+        self._bass: List["_BassVoice"] = []
+        self._vib_phase = 0.0
+        self._live_vibrato_cents = 0.0
+        self._lock = threading.Lock()
+        self._playback_enabled = False
+        self._loop_layers: List[List[tuple[int, str, object]]] = []  # per-layer events: (sample_offset, kind, payload)
 
     def set_bpm(self, bpm: int) -> None:
         bpm = int(max(30, min(300, bpm)))
@@ -88,8 +119,9 @@ class Metronome:
 
     def reset_phase(self) -> None:
         """Reset beat grid so beat 1 happens immediately."""
-        self._sample_index = 0
-        self._next_click_sample = 0
+        with self._lock:
+            self._sample_index = 0
+            self._next_click_sample = 0
 
     def start(self) -> None:
         if self._stream is not None:
@@ -116,9 +148,17 @@ class Metronome:
     def _callback(self, outdata, frames, time_info, status) -> None:
         out = np.zeros((frames, self.channels), dtype=np.float32)
 
+        with self._lock:
+            live_vib_cents = float(self._live_vibrato_cents)
+
+        with self._lock:
+            playback_enabled = self._playback_enabled
+            loop_layers = self._loop_layers
+            start_idx = int(self._sample_index)
+
         if METRONOME_ENABLED and (METRONOME_BEAT_VOLUME > 0 or METRONOME_DOWNBEAT_VOLUME > 0):
-            start = self._sample_index
-            end = self._sample_index + frames
+            start = start_idx
+            end = start_idx + frames
             while self._next_click_sample < end:
                 off = int(self._next_click_sample - start)
                 if off < 0:
@@ -137,19 +177,83 @@ class Metronome:
                         out[off : off + n, 1] += wave[:n] * vol
                 self._next_click_sample += self._beat_samples
 
-        # Chord events + synthesis
+        # Loop playback: fire recorded events at their sample offsets (once per loop).
+        if playback_enabled and loop_layers:
+            start = start_idx
+            end = start_idx + frames
+            for layer in loop_layers:
+                for off, kind, payload in layer:
+                    if start <= off < end:
+                        if kind == "chord":
+                            freqs = np.asarray(payload, dtype=np.float64)
+                            if freqs.size > 0:
+                                self._voices.append(_ChordVoice.from_freqs(freqs, self.sample_rate))
+                        elif kind == "chord_on":
+                            freqs = np.asarray(payload, dtype=np.float64)
+                            if freqs.size > 0:
+                                self._sustain.append(_SustainChordVoice.from_freqs(freqs, self.sample_rate))
+                        elif kind == "chord_off":
+                            if self._sustain:
+                                self._sustain[-1].release()
+                        elif kind == "bass":
+                            self._bass.append(_BassVoice.create(float(payload), self.sample_rate))
+                        elif kind == "kick":
+                            self._drums.append(_KickVoice.create(self.sample_rate))
+                        elif kind == "snare":
+                            self._drums.append(_SnareVoice.create(self.sample_rate))
+
+        # Events: chords / bass / drums
+        try:
+            while True:
+                kind, payload = self._events.get_nowait()
+                if kind == "chord":
+                    freqs = np.asarray(payload, dtype=np.float64)
+                    if freqs.size > 0:
+                        self._voices.append(_ChordVoice.from_freqs(freqs, self.sample_rate))
+                elif kind == "chord_on":
+                    freqs = np.asarray(payload, dtype=np.float64)
+                    if freqs.size > 0:
+                        self._sustain.append(_SustainChordVoice.from_freqs(freqs, self.sample_rate))
+                elif kind == "chord_off":
+                    if self._sustain:
+                        self._sustain[-1].release()
+                elif kind == "bass":
+                    freq = float(payload)
+                    if freq > 0:
+                        self._bass.append(_BassVoice.create(freq, self.sample_rate))
+                elif kind == "kick":
+                    self._drums.append(_KickVoice.create(self.sample_rate))
+                elif kind == "snare":
+                    self._drums.append(_SnareVoice.create(self.sample_rate))
+        except Exception:
+            pass
+
+        # Sustained chord synthesis (for "hold fist to hold chord")
+        if KEYS_ENABLED and KEYS_VOLUME > 0 and self._sustain:
+            t_idx = np.arange(frames, dtype=np.float64)
+            keep_s: List[_SustainChordVoice] = []
+            # advance vibrato LFO phase for this block
+            vib_inc = 2.0 * np.pi * float(KEYS_VIBRATO_HZ) / float(self.sample_rate)
+            vib_phase0 = self._vib_phase
+            self._vib_phase = float((self._vib_phase + vib_inc * float(frames)) % (2.0 * np.pi))
+            vib = np.sin(vib_phase0 + vib_inc * t_idx)
+            vib_ratio = 2.0 ** ((live_vib_cents / 1200.0) * vib)
+
+            for v in self._sustain:
+                y = v.render(t_idx, vib_ratio=vib_ratio)
+                if y is not None:
+                    yy = (y.astype(np.float32) * float(KEYS_VOLUME)).reshape(-1, 1)
+                    out[:, :1] += yy
+                    if self.channels > 1:
+                        out[:, 1:2] += yy
+                if not v.done:
+                    keep_s.append(v)
+            self._sustain = keep_s
+
+        # Chord synthesis
         if KEYS_ENABLED and KEYS_VOLUME > 0:
             try:
-                while True:
-                    kind, payload = self._events.get_nowait()
-                    if kind == "chord":
-                        freqs = np.asarray(payload, dtype=np.float64)
-                        if freqs.size > 0:
-                            self._voices.append(_ChordVoice.from_freqs(freqs, self.sample_rate))
-                    elif kind == "kick":
-                        self._drums.append(_KickVoice.create(self.sample_rate))
-                    elif kind == "snare":
-                        self._drums.append(_SnareVoice.create(self.sample_rate))
+                pass
             except Exception:
                 pass
 
@@ -166,6 +270,21 @@ class Metronome:
                     if not v.done:
                         keep.append(v)
                 self._voices = keep
+
+        # Bass synthesis
+        if BASS_ENABLED and BASS_VOLUME > 0 and self._bass:
+            t_idx = np.arange(frames, dtype=np.float64)
+            keep_b: List[_BassVoice] = []
+            for v in self._bass:
+                y = v.render(t_idx)
+                if y is not None:
+                    yy = (y.astype(np.float32) * float(BASS_VOLUME)).reshape(-1, 1)
+                    out[:, :1] += yy
+                    if self.channels > 1:
+                        out[:, 1:2] += yy
+                if not v.done:
+                    keep_b.append(v)
+            self._bass = keep_b
 
         # Drum events + synthesis (independent of KEYS)
         if KIT_ENABLED and (KIT_KICK_VOLUME > 0 or KIT_SNARE_VOLUME > 0):
@@ -184,7 +303,8 @@ class Metronome:
                 self._drums = keep_d
 
         outdata[:] = out
-        self._sample_index += frames
+        with self._lock:
+            self._sample_index += frames
 
     def beat_in_bar(self) -> int:
         # Based on sample counter: 1..4 looping
@@ -205,11 +325,40 @@ class Metronome:
         """Schedule a chord (list of frequencies) to play ASAP in the audio callback."""
         self._events.put(("chord", list(freqs_hz)))
 
+    def start_hold_chord(self, freqs_hz: List[float]) -> None:
+        self._events.put(("chord_on", list(freqs_hz)))
+
+    def stop_hold_chord(self) -> None:
+        self._events.put(("chord_off", None))
+
+    def set_live_vibrato_cents(self, cents: float) -> None:
+        with self._lock:
+            self._live_vibrato_cents = float(max(0.0, cents))
+
+    def play_bass(self, freq_hz: float) -> None:
+        self._events.put(("bass", float(freq_hz)))
+
     def play_kick(self) -> None:
         self._events.put(("kick", None))
 
     def play_snare(self) -> None:
         self._events.put(("snare", None))
+
+    def set_playback_enabled(self, enabled: bool) -> None:
+        with self._lock:
+            self._playback_enabled = bool(enabled)
+
+    def set_loop_layers(self, layers: List[List[tuple[int, str, object]]]) -> None:
+        # Copy to avoid mutation races.
+        safe: List[List[tuple[int, str, object]]] = []
+        for layer in layers:
+            safe.append([(int(o), str(k), p) for (o, k, p) in layer])
+        with self._lock:
+            self._loop_layers = safe
+
+    def current_sample(self) -> int:
+        with self._lock:
+            return int(self._sample_index)
 
 
 @dataclass
@@ -264,6 +413,63 @@ class _ChordVoice:
 
 
 @dataclass
+class _SustainChordVoice:
+    freqs: np.ndarray
+    phases: np.ndarray
+    pos: int
+    attack: int
+    decay: int
+    release_samps: int
+    sample_rate: int
+    releasing: bool = False
+    release_pos: int = 0
+    done: bool = False
+
+    @staticmethod
+    def from_freqs(freqs: np.ndarray, sample_rate: int) -> "_SustainChordVoice":
+        attack = max(1, int(sample_rate * (KEYS_ATTACK_MS / 1000.0)))
+        decay = max(1, int(sample_rate * (KEYS_DECAY_MS / 1000.0)))
+        release_samps = max(1, int(sample_rate * 0.12))
+        phases = np.random.rand(freqs.size).astype(np.float64) * (2.0 * np.pi)
+        return _SustainChordVoice(freqs=freqs, phases=phases, pos=0, attack=attack, decay=decay, release_samps=release_samps, sample_rate=sample_rate)
+
+    def release(self) -> None:
+        if not self.releasing:
+            self.releasing = True
+            self.release_pos = 0
+
+    def render(self, t_idx: np.ndarray, *, vib_ratio: np.ndarray) -> Optional[np.ndarray]:
+        if self.done:
+            return None
+
+        n = int(t_idx.size)
+        # per-sample phase inc with vibrato
+        inc = (2.0 * np.pi * self.freqs) / float(self.sample_rate)
+        # integrate phase with varying step (approx)
+        # Use base phase + cumulative sum of (inc * vib_ratio)
+        step = (inc[:, None] * vib_ratio[None, :])
+        phases = self.phases[:, None] + np.cumsum(step, axis=1)
+        wave = np.sin(phases).sum(axis=0) / max(1.0, float(self.freqs.size))
+
+        s = (self.pos + t_idx).astype(np.float64)
+        env_attack = np.clip(s / float(self.attack), 0.0, 1.0)
+        env_decay = np.exp(-s / float(self.decay))
+        env = env_attack * env_decay
+
+        if self.releasing:
+            r = np.clip(1.0 - (self.release_pos + t_idx) / float(self.release_samps), 0.0, 1.0)
+            env = env * r
+            self.release_pos += n
+            if self.release_pos >= self.release_samps:
+                self.done = True
+
+        # update phases (advance by last column)
+        self.phases = (phases[:, -1] % (2.0 * np.pi)).astype(np.float64)
+        self.pos += n
+        return wave * env
+
+
+@dataclass
 class _DrumVoice:
     pos: int
     length: int
@@ -295,13 +501,16 @@ class _KickVoice(_DrumVoice):
         f0, f1 = 85.0, 34.0
         f = f1 + (f0 - f1) * np.exp(-tt / 0.05)
         phase = 2.0 * np.pi * np.cumsum(f) / float(self.sample_rate)
-        env = np.exp(-tt / 0.22)
+        env = np.exp(-tt / 0.24)
         attack = np.clip(tt / 0.004, 0.0, 1.0)
         body = np.sin(phase) * env * attack
         sub = np.sin(phase * 0.5) * env * 0.35
         # tiny click at onset
-        click = (np.random.randn(n) * np.exp(-tt / 0.006) * 0.08)
-        y = (body + sub + click) * float(KIT_KICK_VOLUME)
+        click = (np.random.randn(n) * np.exp(-tt / 0.005) * 0.06)
+        y = body + sub + click
+        # a touch of saturation for punch
+        y = np.tanh(y * float(KICK_DRIVE))
+        y = y * float(KIT_KICK_VOLUME)
         self.pos += n
         if self.pos >= self.length:
             self.done = True
@@ -328,18 +537,100 @@ class _SnareVoice(_DrumVoice):
             return None
         n = int(min(t_idx.size, remaining))
         tt = (self.pos + t_idx[:n]) / float(self.sample_rate)
-        env = np.exp(-tt / 0.12)
-        # Make it less hi-hat-like: low-pass the noise via a small moving average.
+        env = np.exp(-tt / 0.14)
         noise = np.random.randn(n).astype(np.float64)
-        k = 9
-        kernel = np.ones(k, dtype=np.float64) / float(k)
-        noise_lp = np.convolve(noise, kernel, mode="same")
-        # Add a little body tone
-        tone = np.sin(2.0 * np.pi * 180.0 * tt)
-        y = (0.85 * noise_lp + 0.15 * tone) * env * float(KIT_SNARE_VOLUME)
+
+        # Band-pass-ish noise (HP then LP) so it sounds like a snare, not a hat.
+        sr = float(self.sample_rate)
+        hp_a = np.exp(-2.0 * np.pi * float(SNARE_HP_HZ) / sr)
+        lp_a = np.exp(-2.0 * np.pi * float(SNARE_LP_HZ) / sr)
+        # one-pole HP via subtracting one-pole LP
+        lp = np.empty_like(noise)
+        ylp = 0.0
+        for i in range(n):
+            ylp = (hp_a * ylp) + ((1.0 - hp_a) * noise[i])
+            lp[i] = ylp
+        hp = noise - lp
+        # then one-pole LP
+        bp = np.empty_like(hp)
+        ybp = 0.0
+        for i in range(n):
+            ybp = (lp_a * ybp) + ((1.0 - lp_a) * hp[i])
+            bp[i] = ybp
+
+        tone = np.sin(2.0 * np.pi * float(SNARE_TONE_HZ) * tt)
+        y = (0.82 * bp + 0.18 * tone) * env
+        y = np.tanh(y * 1.2) * float(KIT_SNARE_VOLUME)
         self.pos += n
         if self.pos >= self.length:
             self.done = True
+        if n < t_idx.size:
+            out = np.zeros((t_idx.size,), dtype=np.float64)
+            out[:n] = y
+            return out
+        return y
+
+
+@dataclass
+class _BassVoice:
+    freq: float
+    phase: float
+    pos: int
+    length: int
+    attack: int
+    decay: int
+    sample_rate: int
+    done: bool = False
+
+    @staticmethod
+    def create(freq: float, sample_rate: int) -> "_BassVoice":
+        length = max(1, int(sample_rate * (BASS_DURATION_MS / 1000.0)))
+        attack = max(1, int(sample_rate * (BASS_ATTACK_MS / 1000.0)))
+        decay = max(1, int(sample_rate * (BASS_DECAY_MS / 1000.0)))
+        return _BassVoice(freq=float(freq), phase=float(np.random.rand() * 2.0 * np.pi), pos=0, length=length, attack=attack, decay=decay, sample_rate=sample_rate)
+
+    def render(self, t_idx: np.ndarray) -> Optional[np.ndarray]:
+        if self.done:
+            return None
+        remaining = self.length - self.pos
+        if remaining <= 0:
+            self.done = True
+            return None
+
+        n = int(min(t_idx.size, remaining))
+        tt = t_idx[:n]
+        inc = (2.0 * np.pi * float(self.freq)) / float(self.sample_rate)
+        phase = self.phase + inc * tt
+
+        # More "instrument-like" bass: band-limited-ish saw (harmonic sum) + sub, then low-pass + drive.
+        H = int(max(1, min(32, int(BASS_HARMONICS))))
+        saw = np.zeros(n, dtype=np.float64)
+        for k in range(1, H + 1):
+            saw += np.sin(phase * float(k)) / float(k)
+        saw *= (2.0 / np.pi)
+        sub = np.sin(phase * 0.5)
+        wave = (1.0 - float(BASS_SUB_MIX)) * saw + float(BASS_SUB_MIX) * sub
+
+        s = (self.pos + tt).astype(np.float64)
+        env_attack = np.clip(s / float(self.attack), 0.0, 1.0)
+        env_decay = np.exp(-s / float(self.decay))
+        env = env_attack * env_decay
+
+        # update
+        self.phase = float((self.phase + inc * float(n)) % (2.0 * np.pi))
+        self.pos += n
+        if self.pos >= self.length:
+            self.done = True
+
+        y = wave * env
+        # one-pole low-pass for warmth
+        a = np.exp(-2.0 * np.pi * float(BASS_LPF_HZ) / float(self.sample_rate))
+        ylp = 0.0
+        for i in range(n):
+            ylp = (a * ylp) + ((1.0 - a) * y[i])
+            y[i] = ylp
+        # gentle saturation
+        y = np.tanh(y * float(BASS_DRIVE))
         if n < t_idx.size:
             out = np.zeros((t_idx.size,), dtype=np.float64)
             out[:n] = y
@@ -1087,7 +1378,7 @@ def main() -> int:
 
     # State
     bpm_values = list(range(60, 181, 5))
-    bpm_idx = bpm_values.index(80) if 80 in bpm_values else 0
+    bpm_idx = bpm_values.index(120) if 120 in bpm_values else 0
     mode_items = ["Major", "Minor"]
     mode_idx = 0
 
@@ -1098,6 +1389,9 @@ def main() -> int:
     right_fist_gate = BoolEdgeGate()
     kit_kick_gate = ClenchGate()
     kit_snare_gate = ClenchGate()
+    keys_hold_gate = ClenchGate()
+    keys_holding = False
+    keys_baseline_y: Optional[int] = None
     last_t = time.time()
     fps = 0.0
     particles: List[Particle] = []
@@ -1110,6 +1404,9 @@ def main() -> int:
     instruments = ["keys", "kit", "bass", "lead"]
     instrument_idx = 0
     chord_slot_state = 3  # persistent chord selection (0..6); prevents jumping when R is missing
+    locked_instrument_idx: Optional[int] = None
+    loop_layers: List[List[tuple[int, str, object]]] = []
+    current_layer: List[tuple[int, str, object]] = []
 
     metro = Metronome(sample_rate=48000, channels=2)
     metro_running = False
@@ -1360,13 +1657,16 @@ def main() -> int:
                     # Ensure countdown starts at Beat 1 (audio/UI share this clock).
                     if METRONOME_ENABLED:
                         metro.reset_phase()
+                    metro.set_playback_enabled(False)
+                    locked_instrument_idx = None
                     proceed_hold.reset()
             else:
                 # Left instruments panel (semi-transparent)
                 instr_rect = (pad, top, pad + int(W * 0.22), bottom)
-                _draw_instrument_panel(display, instr_rect, instruments, selected_idx=instrument_idx)
+                active_instr = instrument_idx if state == "countdown" else (locked_instrument_idx if locked_instrument_idx is not None else instrument_idx)
+                _draw_instrument_panel(display, instr_rect, instruments, selected_idx=int(active_instr))
 
-                # Chord ruler (Keys only): to the left of the right info panel
+                # Chord ruler (Keys + Bass): to the left of the right info panel
                 # IMPORTANT: chord selection (degree/pitch) is driven ONLY by the RIGHT hand.
                 chords = _degree_chords(mode)
                 # Display tonic at the bottom by reversing the list for the ruler.
@@ -1386,11 +1686,11 @@ def main() -> int:
                     t = float(np.clip((cy - inner_y0) / max(1.0, (inner_y1 - inner_y0)), 0.0, 0.999999))
                     chord_slot = min(6, int(t * 7))
                     chord_slot_state = chord_slot
-                if instrument_idx == 0:
+                if active_instr in (0, 2):
                     _draw_chord_ruler(display, chord_rect, chords_ruler, chord_slot)
 
                 # Left hand controls instrument selection (point UP/DOWN)
-                if lh is not None:
+                if state == "countdown" and lh is not None:
                     ldir = _point_direction(lh)
                     ltrig = left_dir_gate.update_and_trigger(
                         ldir,
@@ -1406,21 +1706,71 @@ def main() -> int:
                     left_dir_gate.stable_count = 0
                     left_dir_gate.armed = True
 
-                # Keys chord trigger: left hand closes -> play selected chord (loop only)
-                if instrument_idx == 0 and state == "loop" and lh is not None and KEYS_ENABLED:
-                    left_closed = _hand_openness_score(lh) <= 0.06
-                    if left_fist_gate.rising_edge(left_closed, cooldown_s=0.18):
+                # Keys chord hold + vibrato (loop only):
+                # - closing left fist starts chord and holds it
+                # - opening releases chord
+                # - raising left hand above baseline adds vibrato (depth increases with height)
+                if active_instr == 0 and state == "loop" and lh is not None and KEYS_ENABLED and metro_running:
+                    l_val = float(_hand_openness_score(lh))
+
+                    # open->closed triggers start
+                    fired = keys_hold_gate.update_and_fire(
+                        l_val,
+                        close_th=KEYS_HOLD_CLOSE_TH,
+                        open_th=KEYS_HOLD_OPEN_TH,
+                        cooldown_s=0.12,
+                    )
+                    if fired:
+                        keys_holding = True
+                        keys_baseline_y = int(lh.center_px[1])
                         _, _lb, midi_notes = chords_ruler[chord_slot]
                         freqs = [_midi_to_hz(m) for m in midi_notes]
-                        if metro_running:
-                            metro.play_chord(freqs)
+                        metro.start_hold_chord(freqs)
+                        current_layer.append((metro.current_sample(), "chord_on", list(freqs)))
+
+                    # closed->open releases
+                    if keys_holding and (l_val >= KEYS_HOLD_OPEN_TH):
+                        keys_holding = False
+                        keys_baseline_y = None
+                        metro.set_live_vibrato_cents(0.0)
+                        metro.stop_hold_chord()
+                        current_layer.append((metro.current_sample(), "chord_off", None))
+
+                    # vibrato while holding: raise hand (smaller y) above baseline
+                    if keys_holding and keys_baseline_y is not None:
+                        dy = float(keys_baseline_y - int(lh.center_px[1]))
+                        dy = max(0.0, dy)
+                        depth = float(np.clip(dy / float(KEYS_VIBRATO_HEIGHT_PX_FOR_MAX), 0.0, 1.0)) * float(KEYS_VIBRATO_MAX_CENTS)
+                        metro.set_live_vibrato_cents(depth)
                 else:
-                    left_fist_gate.prev = False
+                    # leaving keys: release any held chord and reset vibrato
+                    if keys_holding and metro_running:
+                        keys_holding = False
+                        keys_baseline_y = None
+                        metro.set_live_vibrato_cents(0.0)
+                        metro.stop_hold_chord()
+                    keys_hold_gate.is_closed = False
+
+                # Bass trigger: same gesture + same ruler, but plays root note as bass (loop only)
+                if active_instr == 2 and state == "loop" and lh is not None and BASS_ENABLED:
+                    left_closed = _hand_openness_score(lh) <= 0.06
+                    if left_fist_gate.rising_edge(left_closed, cooldown_s=0.18):
+                        _rn, _lb, midi_notes = chords_ruler[chord_slot]
+                        root = int(midi_notes[0]) - 24  # drop 2 octaves
+                        root = int(np.clip(root, 24, 72))
+                        if metro_running:
+                            hz = _midi_to_hz(root)
+                            metro.play_bass(hz)
+                            current_layer.append((metro.current_sample(), "bass", float(hz)))
+                else:
+                    # don't clobber the gate if keys is active; only reset if neither uses it
+                    if active_instr not in (0, 2):
+                        left_fist_gate.prev = False
 
                 # Kit triggers (loop only):
                 # - left hand close => kick
                 # - right hand close => snare
-                if instrument_idx == 1 and state == "loop" and KIT_ENABLED and metro_running:
+                if active_instr == 1 and state == "loop" and KIT_ENABLED and metro_running:
                     if lh is not None:
                         l_val = float(_hand_openness_score(lh))
                         if kit_kick_gate.update_and_fire(
@@ -1430,6 +1780,7 @@ def main() -> int:
                             cooldown_s=KIT_TRIGGER_COOLDOWN_S,
                         ):
                             metro.play_kick()
+                            current_layer.append((metro.current_sample(), "kick", None))
                     else:
                         kit_kick_gate.is_closed = False
 
@@ -1442,6 +1793,7 @@ def main() -> int:
                             cooldown_s=KIT_TRIGGER_COOLDOWN_S,
                         ):
                             metro.play_snare()
+                            current_layer.append((metro.current_sample(), "snare", None))
                     else:
                         kit_snare_gate.is_closed = False
                 else:
@@ -1470,6 +1822,7 @@ def main() -> int:
                             ("Count", f"{big_n}"),
                             ("Bar", "0"),
                             ("Beat", str(metro.beat_in_bar())),
+                            ("NextInstr", instruments[instrument_idx]),
                             ("Hands", str(len(hands))),
                             ("2Fists", "yes" if two_fists else "no"),
                             ("L_fist", "yes" if l_fist else "no"),
@@ -1483,25 +1836,29 @@ def main() -> int:
                             ("Thres", f"{FIST_SCORE_THRESHOLD:0.2f}"),
                         ]
                     )
-
-                    if did_proceed:
-                        beats_left = 0
 
                     if beats_left <= 0:
                         # Reset before entering loop so loop always starts at Bar 1 / Beat 1.
                         if METRONOME_ENABLED:
                             metro.reset_phase()
                         state = "loop"
+                        locked_instrument_idx = instrument_idx
+                        current_layer = []
+                        metro.set_loop_layers(loop_layers)
+                        metro.set_playback_enabled(True)
                         proceed_hold.reset()
                 else:
                     # loop state (bar/beat derived from metronome clock)
                     bar = metro.bar_in_loop(8) if metro_running else 1
                     beat = metro.beat_in_bar() if metro_running else 1
+                    beats_elapsed = metro.beats_elapsed() if metro_running else 0
                     extra.extend(
                         [
                             ("State", "loop1"),
                             ("Bar", str(bar)),
                             ("Beat", str(beat)),
+                            ("Instr", instruments[int(active_instr)]),
+                            ("Layers", str(len(loop_layers) + (1 if current_layer else 0))),
                             ("Hands", str(len(hands))),
                             ("2Fists", "yes" if two_fists else "no"),
                             ("L_fist", "yes" if l_fist else "no"),
@@ -1515,6 +1872,18 @@ def main() -> int:
                             ("Thres", f"{FIST_SCORE_THRESHOLD:0.2f}"),
                         ]
                     )
+
+                    # Auto-transition: after 8 bars (32 beats), go to 8-beat countdown, and commit this layer.
+                    if beats_elapsed >= 32:
+                        if current_layer:
+                            loop_layers.append(current_layer)
+                            metro.set_loop_layers(loop_layers)
+                            current_layer = []
+                        metro.set_playback_enabled(False)
+                        if METRONOME_ENABLED:
+                            metro.reset_phase()
+                        state = "countdown"
+                        proceed_hold.reset()
 
                 _draw_info_panel(display, info_rect, bpm=bpm, mode=mode, extra_lines=extra)
 
