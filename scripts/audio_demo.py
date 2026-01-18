@@ -104,6 +104,7 @@ def main() -> int:
             if right_hand is not None:
                 # Use normalized Y position from center of hand
                 frame_height = frame.shape[0]
+                # Guard against division by zero with invalid frames
                 if frame_height > 0:
                     y_norm = right_hand.center_px[1] / frame_height
                     tone_gen.set_position(y_norm, active=True)

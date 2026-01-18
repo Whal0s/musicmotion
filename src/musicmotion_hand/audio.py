@@ -105,8 +105,11 @@ class ToneGenerator:
         Args:
             outdata: Output buffer to fill with audio samples
             frames: Number of frames to generate
-            time_info: Timing information from the audio system
-            status: Stream status flags indicating errors or warnings
+            time_info: Timing information from the audio system (unused)
+            status: Stream status flags indicating errors or warnings (unused)
+        
+        Note: time_info and status are required by the sounddevice API signature
+        but are not used in this simple sine wave generator.
         """
         with self._lock:
             if not self._is_active or self._current_frequency <= 0:
