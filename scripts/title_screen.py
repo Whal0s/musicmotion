@@ -147,12 +147,14 @@ class DirectionGate:
     last_dir: Optional[str] = None
     stable_count: int = 0
     last_trigger_t: float = 0.0
+    armed: bool = True
 
     def update_and_trigger(self, direction: Optional[str], *, stable_frames: int, cooldown_s: float) -> Optional[str]:
         now = time.time()
         if direction is None:
             self.last_dir = None
             self.stable_count = 0
+            self.armed = True
             return None
 
         if direction == self.last_dir:
@@ -160,13 +162,32 @@ class DirectionGate:
         else:
             self.last_dir = direction
             self.stable_count = 1
+            self.armed = True
 
-        if self.stable_count >= stable_frames and (now - self.last_trigger_t) >= cooldown_s:
+        if self.armed and self.stable_count >= stable_frames and (now - self.last_trigger_t) >= cooldown_s:
             self.last_trigger_t = now
             self.stable_count = 0
+            self.armed = False
             return direction
 
         return None
+
+
+@dataclass
+class BoolEdgeGate:
+    """Rising-edge trigger for a boolean condition, with cooldown."""
+
+    prev: bool = False
+    last_trigger_t: float = 0.0
+
+    def rising_edge(self, curr: bool, *, cooldown_s: float) -> bool:
+        now = time.time()
+        fired = False
+        if (not self.prev) and curr and (now - self.last_trigger_t) >= cooldown_s:
+            self.last_trigger_t = now
+            fired = True
+        self.prev = curr
+        return fired
 
 
 HAND_CONNECTIONS: List[Tuple[int, int]] = [
@@ -218,9 +239,13 @@ def _update_and_draw_particles(frame, particles: List[Particle], dt: float) -> N
         p.vy *= 0.98
         out.append(p)
 
-        a = float(np.clip(p.life / 0.45, 0.0, 1.0))
-        col = (int(255 * a), int(255 * a), int(255 * a))
-        cv2.circle(frame, (int(p.x), int(p.y)), int(max(1.0, p.r)), col, -1, lineType=cv2.LINE_AA)
+        # Square particles, pure white.
+        s = int(max(2.0, p.r))
+        x0 = int(p.x - s)
+        y0 = int(p.y - s)
+        x1 = int(p.x + s)
+        y1 = int(p.y + s)
+        cv2.rectangle(frame, (x0, y0), (x1, y1), (255, 255, 255), -1)
     particles[:] = out
 
 
@@ -239,8 +264,8 @@ def _spawn_hand_particles(particles: List[Particle], hand: HandPosition, n: int 
                 y=float(lm.y_px + jitter[1]),
                 vx=float(vx),
                 vy=float(vy),
-                life=float(0.25 + np.random.rand() * 0.35),
-                r=float(1.0 + np.random.rand() * 1.8),
+                life=float(0.22 + np.random.rand() * 0.28),
+                r=float(2.0 + np.random.rand() * 2.5),
             )
         )
 
@@ -302,6 +327,42 @@ def _point_direction(hand: HandPosition) -> Optional[str]:
     return None
 
 
+def _dist(a: Tuple[int, int], b: Tuple[int, int]) -> float:
+    dx = float(a[0] - b[0])
+    dy = float(a[1] - b[1])
+    return (dx * dx + dy * dy) ** 0.5
+
+
+def _all_fingers_closed(hand: HandPosition) -> bool:
+    """
+    Stricter "fist" check: ALL fingers must be folded (thumb + 4 fingers).
+    Uses wrist-distance comparison to detect folding robustly.
+    """
+
+    lms = hand.landmarks
+    if len(lms) < 21:
+        return False
+
+    wrist = (lms[0].x_px, lms[0].y_px)
+    x0, y0, x1, y1 = hand.bbox_px
+    diag = max(1.0, float(((x1 - x0) ** 2 + (y1 - y0) ** 2) ** 0.5))
+
+    def folded(tip: int, mcp: int, slack: float) -> bool:
+        d_tip = _dist((lms[tip].x_px, lms[tip].y_px), wrist)
+        d_mcp = _dist((lms[mcp].x_px, lms[mcp].y_px), wrist)
+        # tip should not extend beyond MCP by more than small slack
+        return d_tip <= d_mcp + slack * diag
+
+    # Tuned slack values: forgiving but prevents "index up" from counting as closed.
+    return (
+        folded(4, 2, 0.02)  # thumb tip vs thumb MCP-ish
+        and folded(8, 5, 0.01)  # index
+        and folded(12, 9, 0.01)  # middle
+        and folded(16, 13, 0.01)  # ring
+        and folded(20, 17, 0.01)  # pinky
+    )
+
+
 def _draw_rect_alpha(frame, rect, color_bgr, alpha: float) -> None:
     """Alpha-blend a solid rect on top of the frame."""
     x0, y0, x1, y1 = rect
@@ -343,7 +404,7 @@ def _draw_panel(frame, rect, title: str, active: bool, selected_idx: int, items:
         cv2.putText(frame, text, (x0 + 18, yy), cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2, cv2.LINE_AA)
 
 
-def _draw_info_panel(frame, rect, bpm: int, mode: str) -> None:
+def _draw_info_panel(frame, rect, bpm: int, mode: str, extra_lines: Optional[List[Tuple[str, str]]] = None) -> None:
     x0, y0, x1, y1 = rect
     _draw_rect_alpha(frame, rect, (20, 20, 20), alpha=0.62)
     cv2.rectangle(frame, (x0, y0), (x1, y1), (60, 60, 60), 2)
@@ -354,14 +415,32 @@ def _draw_info_panel(frame, rect, bpm: int, mode: str) -> None:
         ("Loop", "8 bars"),
         ("BPM", str(bpm)),
         ("Key", mode),
-        ("Next", "Instrument select (TODO)"),
         ("Ctrl", "Right hand"),
     ]
+    if extra_lines:
+        lines.extend(extra_lines)
     yy = y0 + 62
     for k, v in lines:
         cv2.putText(frame, f"{k}:", (x0 + 12, yy), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (170, 170, 170), 2, cv2.LINE_AA)
         cv2.putText(frame, f"{v}", (x0 + 90, yy), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 2, cv2.LINE_AA)
         yy += 28
+
+
+def _draw_instrument_panel(frame, rect, instruments: List[str], selected_idx: int = 0) -> None:
+    x0, y0, x1, y1 = rect
+    _draw_rect_alpha(frame, rect, (18, 18, 18), alpha=0.62)
+    cv2.rectangle(frame, (x0, y0), (x1, y1), (80, 80, 80), 2)
+    cv2.putText(frame, "INSTRUMENTS", (x0 + 12, y0 + 30), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2, cv2.LINE_AA)
+
+    yy = y0 + 68
+    for i, name in enumerate(instruments):
+        if i == selected_idx:
+            _draw_rect_alpha(frame, (x0 + 10, yy - 24, x1 - 10, yy + 8), (40, 255, 120), alpha=0.75)
+            col = (10, 10, 10)
+        else:
+            col = (230, 230, 230)
+        cv2.putText(frame, name.upper(), (x0 + 16, yy), cv2.FONT_HERSHEY_SIMPLEX, 0.85, col, 2, cv2.LINE_AA)
+        yy += 42
 
 
 def main() -> int:
@@ -401,6 +480,13 @@ def main() -> int:
     last_t = time.time()
     fps = 0.0
     particles: List[Particle] = []
+    fist_gate = BoolEdgeGate()
+
+    state: str = "title"  # title -> countdown -> loop
+    countdown_start_t: Optional[float] = None
+    loop_start_t: Optional[float] = None
+    instruments = ["keys", "bass", "kit", "lead"]
+    instrument_idx = 0
 
     with HandPositionDetector(max_num_hands=1, tasks_model_path=args.tasks_model) as detector:
         while True:
@@ -442,28 +528,49 @@ def main() -> int:
             mode_rect = (pad + left_w + pad, top, pad + left_w + pad + right_w, bottom)
             info_rect = (W - info_w - pad, top, W - pad, bottom)
 
-            # Controls:
+            bpm = bpm_values[bpm_idx]
+            mode = mode_items[mode_idx]
+
+            # Controls (right hand):
             # - point LEFT/RIGHT: choose active control (BPM vs KEY MODE)
             # - point UP/DOWN: adjust the active control
+            # - close hand (fist): continue / start
             if rh is not None:
                 direction = _point_direction(rh)
-                trig = dir_gate.update_and_trigger(direction, stable_frames=3, cooldown_s=0.22)
+                trig = dir_gate.update_and_trigger(direction, stable_frames=3, cooldown_s=0.35)
 
-                if trig == "left":
-                    active_panel = "bpm"
-                elif trig == "right":
-                    active_panel = "mode"
-                elif trig == "up":
-                    if active_panel == "bpm":
-                        bpm_idx = int(np.clip(bpm_idx + 1, 0, len(bpm_values) - 1))
-                    else:
-                        # Explicit up/down mapping for mode to feel deterministic.
-                        mode_idx = 0  # Major
-                elif trig == "down":
-                    if active_panel == "bpm":
-                        bpm_idx = int(np.clip(bpm_idx - 1, 0, len(bpm_values) - 1))
-                    else:
-                        mode_idx = 1  # Minor
+                if state == "title":
+                    if trig == "left":
+                        active_panel = "bpm"
+                    elif trig == "right":
+                        active_panel = "mode"
+                    elif trig == "up":
+                        if active_panel == "bpm":
+                            bpm_idx = int(np.clip(bpm_idx - 1, 0, len(bpm_values) - 1))
+                        else:
+                            mode_idx = 0  # Major
+                    elif trig == "down":
+                        if active_panel == "bpm":
+                            bpm_idx = int(np.clip(bpm_idx + 1, 0, len(bpm_values) - 1))
+                        else:
+                            mode_idx = 1  # Minor
+
+                # Fist to go next
+                is_fist = _all_fingers_closed(rh)
+                if fist_gate.rising_edge(is_fist, cooldown_s=1.0):
+                    if state == "title":
+                        state = "countdown"
+                        countdown_start_t = time.time()
+                        loop_start_t = None
+                    elif state == "countdown":
+                        # allow skipping countdown if desired
+                        state = "loop"
+                        loop_start_t = time.time()
+                    elif state == "loop":
+                        # placeholder: return to title
+                        state = "title"
+                        countdown_start_t = None
+                        loop_start_t = None
 
                 # Retro hand overlay: white lines + particles + translucent bbox
                 _draw_hand_bbox_alpha(display, rh, alpha=0.14)
@@ -472,14 +579,50 @@ def main() -> int:
             else:
                 dir_gate.last_dir = None
                 dir_gate.stable_count = 0
+                dir_gate.armed = True
+                fist_gate.prev = False
 
             _update_and_draw_particles(display, particles, dt=dt)
 
-            # Render panels
-            bpm_items = [f"{bpm} BPM" for bpm in bpm_values]
-            _draw_panel(display, bpm_rect, "BPM", active_panel == "bpm", bpm_idx, bpm_items)
-            _draw_panel(display, mode_rect, "KEY MODE", active_panel == "mode", mode_idx, mode_items)
-            _draw_info_panel(display, info_rect, bpm=bpm_values[bpm_idx], mode=mode_items[mode_idx])
+            # Render UI by state
+            if state == "title":
+                bpm_items = [f"{b} BPM" for b in bpm_values]
+                _draw_panel(display, bpm_rect, "BPM", active_panel == "bpm", bpm_idx, bpm_items)
+                _draw_panel(display, mode_rect, "KEY MODE", active_panel == "mode", mode_idx, mode_items)
+                _draw_info_panel(display, info_rect, bpm=bpm, mode=mode, extra_lines=[("State", "setup")])
+            else:
+                # Left instruments panel (semi-transparent)
+                instr_rect = (pad, top, pad + int(W * 0.22), bottom)
+                _draw_instrument_panel(display, instr_rect, instruments, selected_idx=instrument_idx)
+
+                # Keep the middle empty; status goes into the PROJECT panel on the right.
+                extra: List[Tuple[str, str]] = []
+                if state == "countdown":
+                    # 2 bars in 4/4 => 8 beats
+                    total_beats = 8.0
+                    elapsed = 0.0 if countdown_start_t is None else (time.time() - countdown_start_t)
+                    beat_dur = 60.0 / float(max(1, bpm))
+                    beats_left = max(0.0, total_beats - (elapsed / beat_dur))
+                    extra.extend(
+                        [
+                            ("State", "countdown"),
+                            ("Beats", f"{int(np.ceil(beats_left))}"),
+                            ("Bars", f"{(beats_left / 4.0):0.1f}"),
+                        ]
+                    )
+
+                    if beats_left <= 0.0:
+                        state = "loop"
+                        loop_start_t = time.time()
+                else:
+                    # loop state (placeholder)
+                    total_bars = 8.0
+                    elapsed = 0.0 if loop_start_t is None else (time.time() - loop_start_t)
+                    bar_dur = (60.0 / float(max(1, bpm))) * 4.0  # 4 beats per bar
+                    bars = min(total_bars, elapsed / bar_dur)
+                    extra.extend([("State", "loop1"), ("Bars", f"{bars:0.1f}/{total_bars:0.0f}")])
+
+                _draw_info_panel(display, info_rect, bpm=bpm, mode=mode, extra_lines=extra)
 
             # Banner & HUD
             if banner.shape[1] != W:
@@ -488,7 +631,7 @@ def main() -> int:
             hud = banner.copy()
             cv2.putText(
                 hud,
-                "point LEFT/RIGHT: choose control | point UP/DOWN: adjust | q/esc quit",
+                "point LEFT/RIGHT: choose control | point UP/DOWN: adjust | FULL fist: continue | q/esc quit",
                 (14, hud.shape[0] - 12),
                 cv2.FONT_HERSHEY_PLAIN,
                 1.2,
