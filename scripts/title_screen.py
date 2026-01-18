@@ -54,6 +54,10 @@ KIT_TRIGGER_CLOSE_TH = 0.05
 KIT_TRIGGER_OPEN_TH = 0.12
 KIT_TRIGGER_COOLDOWN_S = 0.12
 
+# --- Instrument selection (left hand) tuning ---
+INSTR_SELECT_STABLE_FRAMES = 6
+INSTR_SELECT_COOLDOWN_S = 0.7
+
 
 class Metronome:
     def __init__(self, sample_rate: int = 48000, channels: int = 2) -> None:
@@ -1388,7 +1392,11 @@ def main() -> int:
                 # Left hand controls instrument selection (point UP/DOWN)
                 if lh is not None:
                     ldir = _point_direction(lh)
-                    ltrig = left_dir_gate.update_and_trigger(ldir, stable_frames=3, cooldown_s=0.35)
+                    ltrig = left_dir_gate.update_and_trigger(
+                        ldir,
+                        stable_frames=INSTR_SELECT_STABLE_FRAMES,
+                        cooldown_s=INSTR_SELECT_COOLDOWN_S,
+                    )
                     if ltrig == "up":
                         instrument_idx = int(np.clip(instrument_idx - 1, 0, len(instruments) - 1))
                     elif ltrig == "down":
