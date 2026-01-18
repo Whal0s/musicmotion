@@ -100,20 +100,24 @@ def main() -> int:
 
             if right_hand is not None:
                 # Use normalized Y position from center of hand
-                y_norm = right_hand.center_px[1] / frame.shape[0]
-                tone_gen.set_position(y_norm, active=True)
+                frame_height = frame.shape[0]
+                if frame_height > 0:
+                    y_norm = right_hand.center_px[1] / frame_height
+                    tone_gen.set_position(y_norm, active=True)
 
-                # Visual feedback for active note
-                cv2.putText(
-                    frame,
-                    f"Playing: Y={y_norm:.2f}",
-                    (12, 60),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.8,
-                    (0, 255, 0),
-                    2,
-                    cv2.LINE_AA,
-                )
+                    # Visual feedback for active note
+                    cv2.putText(
+                        frame,
+                        f"Playing: Y={y_norm:.2f}",
+                        (12, 60),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.8,
+                        (0, 255, 0),
+                        2,
+                        cv2.LINE_AA,
+                    )
+                else:
+                    tone_gen.set_position(0.5, active=False)
             else:
                 # No right hand detected - silence
                 tone_gen.set_position(0.5, active=False)

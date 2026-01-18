@@ -119,6 +119,7 @@ class ToneGenerator:
             outdata[:, 0] = wave.astype(np.float32)
             
             # Update phase for continuity (use modulo to prevent overflow)
+            # Wrap phase every 1000 seconds to keep the value manageable
             self._phase = (self._phase + frames) % (self.sample_rate * 1000)
 
     def __enter__(self) -> "ToneGenerator":
