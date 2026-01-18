@@ -38,6 +38,27 @@ python3 scripts/retro_ui_demo.py
 Controls:
 - `q`: quit
 
+### Audio demo (sound based on hand position)
+
+```bash
+python scripts/audio_demo.py
+```
+
+This demo plays musical tones based on the **vertical position of your right hand**:
+- Higher hand = higher pitch
+- Lower hand = lower pitch
+- Notes are quantized to a musical scale (configurable)
+
+Options:
+- `--scale {c_major,c_minor,pentatonic,blues,chromatic}`: Choose musical scale (default: pentatonic)
+- `--volume VOLUME`: Set volume level from 0.0 to 1.0 (default: 0.3)
+- `q`: quit
+
+**Note**: On Linux, you may need to install the PortAudio library:
+```bash
+sudo apt-get install portaudio19-dev libportaudio2
+```
+
 ### Troubleshooting
 
 - **`source: no such file or directory: .venv/bin/activate`**: you haven’t created the venv yet. Run:
