@@ -104,6 +104,15 @@ def _right_hand(hands: List[HandPosition]) -> Optional[HandPosition]:
     return hands[0] if hands else None
 
 
+def _hand_lr_label(hand: HandPosition) -> str:
+    lab = (hand.handedness_label or "").lower()
+    if lab == "left":
+        return "L"
+    if lab == "right":
+        return "R"
+    return "?"
+
+
 def _hand_openness_score(hand: HandPosition) -> float:
     """
     0.0 = closed fist-ish, 1.0 = open-ish.
@@ -229,14 +238,16 @@ def _update_and_draw_particles(frame, particles: List[Particle], dt: float) -> N
     if not particles:
         return
     out: List[Particle] = []
+    layer = np.zeros_like(frame)
     for p in particles:
         p.life -= dt
         if p.life <= 0:
             continue
         p.x += p.vx * dt
         p.y += p.vy * dt
-        p.vx *= 0.98
-        p.vy *= 0.98
+        # Flame-ish drift: keep rising, slight damping, add a tiny flicker.
+        p.vx = p.vx * 0.97 + float(np.random.randn() * 6.0)
+        p.vy = p.vy * 0.99 - 4.0
         out.append(p)
 
         # Square particles, pure white.
@@ -245,27 +256,32 @@ def _update_and_draw_particles(frame, particles: List[Particle], dt: float) -> N
         y0 = int(p.y - s)
         x1 = int(p.x + s)
         y1 = int(p.y + s)
-        cv2.rectangle(frame, (x0, y0), (x1, y1), (255, 255, 255), -1)
+        cv2.rectangle(layer, (x0, y0), (x1, y1), (255, 255, 255), -1)
+
+    # Additive-ish blend for a brighter "bloom" look.
+    cv2.add(frame, layer, dst=frame)
     particles[:] = out
 
 
 def _spawn_hand_particles(particles: List[Particle], hand: HandPosition, n: int = 10) -> None:
     if len(hand.landmarks) < 21:
         return
-    emit_idxs = [0, 4, 8, 12, 16, 20]
+    emit_idxs = [0, 4, 8, 12, 16, 20, 9]  # wrist + fingertips + palm-ish
     for _ in range(n):
         idx = emit_idxs[int(np.random.randint(0, len(emit_idxs)))]
         lm = hand.landmarks[idx]
-        jitter = np.random.randn(2) * 3.0
-        vx, vy = (np.random.randn() * 10.0, np.random.randn() * 10.0 - 12.0)
+        jitter = np.random.randn(2) * 5.0
+        # Strong upward bias, small spread sideways -> flame plume.
+        vx = float(np.random.randn() * 28.0)
+        vy = float(-120.0 - np.random.rand() * 120.0 + np.random.randn() * 14.0)
         particles.append(
             Particle(
                 x=float(lm.x_px + jitter[0]),
                 y=float(lm.y_px + jitter[1]),
-                vx=float(vx),
-                vy=float(vy),
-                life=float(0.22 + np.random.rand() * 0.28),
-                r=float(2.0 + np.random.rand() * 2.5),
+                vx=vx,
+                vy=vy,
+                life=float(0.40 + np.random.rand() * 0.55),
+                r=float(3.0 + np.random.rand() * 4.5),
             )
         )
 
@@ -288,6 +304,14 @@ def _draw_retro_hand(frame, hand: HandPosition) -> None:
     for lm in hand.landmarks:
         cv2.circle(frame, (lm.x_px, lm.y_px), 5, (30, 30, 30), -1, lineType=cv2.LINE_AA)
         cv2.circle(frame, (lm.x_px, lm.y_px), 3, (255, 255, 255), -1, lineType=cv2.LINE_AA)
+
+
+def _draw_hand_label(frame, hand: HandPosition) -> None:
+    x0, y0, x1, y1 = hand.bbox_px
+    label = _hand_lr_label(hand)
+    org = (x0 + 8, max(28, y0 - 10))
+    cv2.putText(frame, label, (org[0] + 2, org[1] + 2), cv2.FONT_HERSHEY_SIMPLEX, 1.1, (0, 0, 0), 5, cv2.LINE_AA)
+    cv2.putText(frame, label, org, cv2.FONT_HERSHEY_SIMPLEX, 1.1, (255, 255, 255), 3, cv2.LINE_AA)
 
 
 def _point_direction(hand: HandPosition) -> Optional[str]:
@@ -363,6 +387,36 @@ def _all_fingers_closed(hand: HandPosition) -> bool:
     )
 
 
+def _two_fists_closed(hands: List[HandPosition]) -> bool:
+    """
+    Require two fists (both hands).
+    Prefers explicit Left+Right labels if present; otherwise requires any 2 closed hands.
+    """
+
+    if len(hands) < 2:
+        return False
+
+    left = None
+    right = None
+    for h in hands:
+        lab = (h.handedness_label or "").lower()
+        if lab == "left":
+            left = h
+        elif lab == "right":
+            right = h
+
+    if left is not None and right is not None:
+        return _all_fingers_closed(left) and _all_fingers_closed(right)
+
+    closed = 0
+    for h in hands:
+        if _all_fingers_closed(h):
+            closed += 1
+        if closed >= 2:
+            return True
+    return False
+
+
 def _draw_rect_alpha(frame, rect, color_bgr, alpha: float) -> None:
     """Alpha-blend a solid rect on top of the frame."""
     x0, y0, x1, y1 = rect
@@ -377,6 +431,27 @@ def _draw_rect_alpha(frame, rect, color_bgr, alpha: float) -> None:
     overlay = np.empty_like(roi)
     overlay[:, :] = color_bgr
     cv2.addWeighted(overlay, float(alpha), roi, float(1.0 - alpha), 0.0, dst=roi)
+
+
+def _blend_image_alpha(dst_bgr, src_bgr, x: int, y: int, alpha: float) -> None:
+    """Alpha-blend `src_bgr` onto `dst_bgr` at top-left (x,y)."""
+    if alpha <= 0.0:
+        return
+    h, w = src_bgr.shape[:2]
+    H, W = dst_bgr.shape[:2]
+    x0 = max(0, x)
+    y0 = max(0, y)
+    x1 = min(W, x + w)
+    y1 = min(H, y + h)
+    if x1 <= x0 or y1 <= y0:
+        return
+    sx0 = x0 - x
+    sy0 = y0 - y
+    sx1 = sx0 + (x1 - x0)
+    sy1 = sy0 + (y1 - y0)
+    roi = dst_bgr[y0:y1, x0:x1]
+    src = src_bgr[sy0:sy1, sx0:sx1]
+    cv2.addWeighted(src, float(alpha), roi, float(1.0 - alpha), 0.0, dst=roi)
 
 
 def _draw_panel(frame, rect, title: str, active: bool, selected_idx: int, items: List[str]) -> None:
@@ -488,7 +563,7 @@ def main() -> int:
     instruments = ["keys", "bass", "kit", "lead"]
     instrument_idx = 0
 
-    with HandPositionDetector(max_num_hands=1, tasks_model_path=args.tasks_model) as detector:
+    with HandPositionDetector(max_num_hands=2, tasks_model_path=args.tasks_model) as detector:
         while True:
             ok, frame = cap.read()
             if not ok:
@@ -505,7 +580,7 @@ def main() -> int:
                 display = frame
                 hands = hands_raw
 
-            # Choose the right hand for control.
+            # Choose the right hand for control (but render both hands).
             rh = _right_hand(hands)
 
             # Update fps
@@ -535,6 +610,17 @@ def main() -> int:
             # - point LEFT/RIGHT: choose active control (BPM vs KEY MODE)
             # - point UP/DOWN: adjust the active control
             # - close hand (fist): continue / start
+            # Always render all detected hands with retro highlight + particles + L/R labels.
+            for hnd in hands:
+                _draw_hand_bbox_alpha(display, hnd, alpha=0.14)
+                _draw_retro_hand(display, hnd)
+                _draw_hand_label(display, hnd)
+                _spawn_hand_particles(particles, hnd, n=14)
+
+            # Soft cap particle count (prevents runaway buildup).
+            if len(particles) > 1600:
+                particles[:] = particles[-1200:]
+
             if rh is not None:
                 direction = _point_direction(rh)
                 trig = dir_gate.update_and_trigger(direction, stable_frames=3, cooldown_s=0.35)
@@ -572,10 +658,6 @@ def main() -> int:
                         countdown_start_t = None
                         loop_start_t = None
 
-                # Retro hand overlay: white lines + particles + translucent bbox
-                _draw_hand_bbox_alpha(display, rh, alpha=0.14)
-                _draw_retro_hand(display, rh)
-                _spawn_hand_particles(particles, rh, n=8)
             else:
                 dir_gate.last_dir = None
                 dir_gate.stable_count = 0
