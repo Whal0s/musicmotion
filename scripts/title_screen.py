@@ -5,7 +5,7 @@ import os
 import platform
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
 
 import cv2
@@ -46,6 +46,14 @@ KEYS_ATTACK_MS = 8.0
 KEYS_DECAY_MS = 650.0
 KEYS_DURATION_MS = 900.0
 
+# --- Kit (drums) synth knobs ---
+KIT_ENABLED = True
+KIT_KICK_VOLUME = 0.22  # 0..1
+KIT_SNARE_VOLUME = 0.16  # 0..1
+KIT_TRIGGER_CLOSE_TH = 0.05
+KIT_TRIGGER_OPEN_TH = 0.12
+KIT_TRIGGER_COOLDOWN_S = 0.12
+
 
 class Metronome:
     def __init__(self, sample_rate: int = 48000, channels: int = 2) -> None:
@@ -67,6 +75,7 @@ class Metronome:
 
         self._events: "queue.SimpleQueue[tuple[str, object]]" = queue.SimpleQueue()
         self._voices: List["_ChordVoice"] = []
+        self._drums: List["_DrumVoice"] = []
 
     def set_bpm(self, bpm: int) -> None:
         bpm = int(max(30, min(300, bpm)))
@@ -133,6 +142,10 @@ class Metronome:
                         freqs = np.asarray(payload, dtype=np.float64)
                         if freqs.size > 0:
                             self._voices.append(_ChordVoice.from_freqs(freqs, self.sample_rate))
+                    elif kind == "kick":
+                        self._drums.append(_KickVoice.create(self.sample_rate))
+                    elif kind == "snare":
+                        self._drums.append(_SnareVoice.create(self.sample_rate))
             except Exception:
                 pass
 
@@ -149,6 +162,22 @@ class Metronome:
                     if not v.done:
                         keep.append(v)
                 self._voices = keep
+
+        # Drum events + synthesis (independent of KEYS)
+        if KIT_ENABLED and (KIT_KICK_VOLUME > 0 or KIT_SNARE_VOLUME > 0):
+            if self._drums:
+                t_idx = np.arange(frames, dtype=np.float64)
+                keep_d: List[_DrumVoice] = []
+                for d in self._drums:
+                    y = d.render(t_idx)
+                    if y is not None:
+                        yy = y.astype(np.float32).reshape(-1, 1)
+                        out[:, :1] += yy
+                        if self.channels > 1:
+                            out[:, 1:2] += yy
+                    if not d.done:
+                        keep_d.append(d)
+                self._drums = keep_d
 
         outdata[:] = out
         self._sample_index += frames
@@ -171,6 +200,12 @@ class Metronome:
     def play_chord(self, freqs_hz: List[float]) -> None:
         """Schedule a chord (list of frequencies) to play ASAP in the audio callback."""
         self._events.put(("chord", list(freqs_hz)))
+
+    def play_kick(self) -> None:
+        self._events.put(("kick", None))
+
+    def play_snare(self) -> None:
+        self._events.put(("snare", None))
 
 
 @dataclass
@@ -222,6 +257,90 @@ class _ChordVoice:
             out[:n] = wave * env
             return out
         return wave * env
+
+
+@dataclass
+class _DrumVoice:
+    pos: int
+    length: int
+    sample_rate: int
+    done: bool = field(default=False, init=False)
+
+    def render(self, t_idx: np.ndarray) -> Optional[np.ndarray]:
+        raise NotImplementedError
+
+
+@dataclass
+class _KickVoice(_DrumVoice):
+    @staticmethod
+    def create(sample_rate: int) -> "_KickVoice":
+        # Deeper kick: low pitch drop + longer body + tiny click.
+        length = max(1, int(sample_rate * 0.28))
+        return _KickVoice(pos=0, length=length, sample_rate=sample_rate)
+
+    def render(self, t_idx: np.ndarray) -> Optional[np.ndarray]:
+        if self.done:
+            return None
+        remaining = self.length - self.pos
+        if remaining <= 0:
+            self.done = True
+            return None
+        n = int(min(t_idx.size, remaining))
+        tt = (self.pos + t_idx[:n]) / float(self.sample_rate)
+        # Exponential pitch drop (deeper)
+        f0, f1 = 85.0, 34.0
+        f = f1 + (f0 - f1) * np.exp(-tt / 0.05)
+        phase = 2.0 * np.pi * np.cumsum(f) / float(self.sample_rate)
+        env = np.exp(-tt / 0.22)
+        attack = np.clip(tt / 0.004, 0.0, 1.0)
+        body = np.sin(phase) * env * attack
+        sub = np.sin(phase * 0.5) * env * 0.35
+        # tiny click at onset
+        click = (np.random.randn(n) * np.exp(-tt / 0.006) * 0.08)
+        y = (body + sub + click) * float(KIT_KICK_VOLUME)
+        self.pos += n
+        if self.pos >= self.length:
+            self.done = True
+        if n < t_idx.size:
+            out = np.zeros((t_idx.size,), dtype=np.float64)
+            out[:n] = y
+            return out
+        return y
+
+
+@dataclass
+class _SnareVoice(_DrumVoice):
+    @staticmethod
+    def create(sample_rate: int) -> "_SnareVoice":
+        length = max(1, int(sample_rate * 0.22))
+        return _SnareVoice(pos=0, length=length, sample_rate=sample_rate)
+
+    def render(self, t_idx: np.ndarray) -> Optional[np.ndarray]:
+        if self.done:
+            return None
+        remaining = self.length - self.pos
+        if remaining <= 0:
+            self.done = True
+            return None
+        n = int(min(t_idx.size, remaining))
+        tt = (self.pos + t_idx[:n]) / float(self.sample_rate)
+        env = np.exp(-tt / 0.12)
+        # Make it less hi-hat-like: low-pass the noise via a small moving average.
+        noise = np.random.randn(n).astype(np.float64)
+        k = 9
+        kernel = np.ones(k, dtype=np.float64) / float(k)
+        noise_lp = np.convolve(noise, kernel, mode="same")
+        # Add a little body tone
+        tone = np.sin(2.0 * np.pi * 180.0 * tt)
+        y = (0.85 * noise_lp + 0.15 * tone) * env * float(KIT_SNARE_VOLUME)
+        self.pos += n
+        if self.pos >= self.length:
+            self.done = True
+        if n < t_idx.size:
+            out = np.zeros((t_idx.size,), dtype=np.float64)
+            out[:n] = y
+            return out
+        return y
 
 ASCII_LOGO = [
                                                               
@@ -495,6 +614,36 @@ class BoolEdgeGate:
             fired = True
         self.prev = curr
         return fired
+
+
+@dataclass
+class ClenchGate:
+    """
+    Hand clench gate with hysteresis:
+    - becomes 'closed' when value <= close_th
+    - becomes 'open' when value >= open_th
+    - triggers ONLY on open->closed transition (with cooldown)
+    """
+
+    is_closed: bool = False
+    last_fire_t: float = 0.0
+
+    def update_and_fire(self, value: float, *, close_th: float, open_th: float, cooldown_s: float) -> bool:
+        now = time.time()
+
+        # reopen
+        if self.is_closed:
+            if value >= open_th:
+                self.is_closed = False
+            return False
+
+        # open -> closed edge
+        if value <= close_th:
+            self.is_closed = True
+            if (now - self.last_fire_t) >= cooldown_s:
+                self.last_fire_t = now
+                return True
+        return False
 
 
 @dataclass
@@ -942,6 +1091,9 @@ def main() -> int:
     dir_gate = DirectionGate()
     left_dir_gate = DirectionGate()
     left_fist_gate = BoolEdgeGate()
+    right_fist_gate = BoolEdgeGate()
+    kit_kick_gate = ClenchGate()
+    kit_snare_gate = ClenchGate()
     last_t = time.time()
     fps = 0.0
     particles: List[Particle] = []
@@ -1256,6 +1408,37 @@ def main() -> int:
                             metro.play_chord(freqs)
                 else:
                     left_fist_gate.prev = False
+
+                # Kit triggers (loop only):
+                # - left hand close => kick
+                # - right hand close => snare
+                if instrument_idx == 1 and state == "loop" and KIT_ENABLED and metro_running:
+                    if lh is not None:
+                        l_val = float(_hand_openness_score(lh))
+                        if kit_kick_gate.update_and_fire(
+                            l_val,
+                            close_th=KIT_TRIGGER_CLOSE_TH,
+                            open_th=KIT_TRIGGER_OPEN_TH,
+                            cooldown_s=KIT_TRIGGER_COOLDOWN_S,
+                        ):
+                            metro.play_kick()
+                    else:
+                        kit_kick_gate.is_closed = False
+
+                    if r_hand is not None:
+                        r_val = float(_hand_openness_score(r_hand))
+                        if kit_snare_gate.update_and_fire(
+                            r_val,
+                            close_th=KIT_TRIGGER_CLOSE_TH,
+                            open_th=KIT_TRIGGER_OPEN_TH,
+                            cooldown_s=KIT_TRIGGER_COOLDOWN_S,
+                        ):
+                            metro.play_snare()
+                    else:
+                        kit_snare_gate.is_closed = False
+                else:
+                    kit_kick_gate.is_closed = False
+                    kit_snare_gate.is_closed = False
 
                 # Keep the middle empty; status goes into the PROJECT panel on the right.
                 extra: List[Tuple[str, str]] = []
