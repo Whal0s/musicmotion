@@ -11,6 +11,7 @@ from typing import List, Optional, Tuple
 import cv2
 import numpy as np
 import sounddevice as sd
+import queue
 
 # Allow running without installing the package (repo-local usage).
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
@@ -38,6 +39,13 @@ METRONOME_CLICK_HZ = 1100.0
 METRONOME_DOWNBEAT_HZ = 750.0
 METRONOME_CLICK_MS = 28.0
 
+# --- Keys (chords) synth knobs ---
+KEYS_ENABLED = True
+KEYS_VOLUME = 0.16  # 0..1
+KEYS_ATTACK_MS = 8.0
+KEYS_DECAY_MS = 650.0
+KEYS_DURATION_MS = 900.0
+
 
 class Metronome:
     def __init__(self, sample_rate: int = 48000, channels: int = 2) -> None:
@@ -56,6 +64,9 @@ class Metronome:
         down = (np.sin(2.0 * np.pi * float(METRONOME_DOWNBEAT_HZ) * t) * env).astype(np.float32)
         self._click = click
         self._down = down
+
+        self._events: "queue.SimpleQueue[tuple[str, object]]" = queue.SimpleQueue()
+        self._voices: List["_ChordVoice"] = []
 
     def set_bpm(self, bpm: int) -> None:
         bpm = int(max(30, min(300, bpm)))
@@ -113,6 +124,32 @@ class Metronome:
                         out[off : off + n, 1] += wave[:n] * vol
                 self._next_click_sample += self._beat_samples
 
+        # Chord events + synthesis
+        if KEYS_ENABLED and KEYS_VOLUME > 0:
+            try:
+                while True:
+                    kind, payload = self._events.get_nowait()
+                    if kind == "chord":
+                        freqs = np.asarray(payload, dtype=np.float64)
+                        if freqs.size > 0:
+                            self._voices.append(_ChordVoice.from_freqs(freqs, self.sample_rate))
+            except Exception:
+                pass
+
+            if self._voices:
+                t_idx = np.arange(frames, dtype=np.float64)
+                keep: List[_ChordVoice] = []
+                for v in self._voices:
+                    y = v.render(t_idx)
+                    if y is not None:
+                        yy = (y.astype(np.float32) * float(KEYS_VOLUME)).reshape(-1, 1)
+                        out[:, :1] += yy
+                        if self.channels > 1:
+                            out[:, 1:2] += yy
+                    if not v.done:
+                        keep.append(v)
+                self._voices = keep
+
         outdata[:] = out
         self._sample_index += frames
 
@@ -130,6 +167,61 @@ class Metronome:
         # 1..bars_per_loop looping
         b = self.beats_elapsed()
         return ((b // 4) % max(1, bars_per_loop)) + 1
+
+    def play_chord(self, freqs_hz: List[float]) -> None:
+        """Schedule a chord (list of frequencies) to play ASAP in the audio callback."""
+        self._events.put(("chord", list(freqs_hz)))
+
+
+@dataclass
+class _ChordVoice:
+    freqs: np.ndarray  # (n,)
+    phases: np.ndarray  # (n,)
+    pos: int
+    length: int
+    attack: int
+    decay: int
+    sample_rate: int
+    done: bool = False
+
+    @staticmethod
+    def from_freqs(freqs: np.ndarray, sample_rate: int) -> "_ChordVoice":
+        length = max(1, int(sample_rate * (KEYS_DURATION_MS / 1000.0)))
+        attack = max(1, int(sample_rate * (KEYS_ATTACK_MS / 1000.0)))
+        decay = max(1, int(sample_rate * (KEYS_DECAY_MS / 1000.0)))
+        phases = np.random.rand(freqs.size).astype(np.float64) * (2.0 * np.pi)
+        return _ChordVoice(freqs=freqs, phases=phases, pos=0, length=length, attack=attack, decay=decay, sample_rate=sample_rate)
+
+    def render(self, t_idx: np.ndarray) -> Optional[np.ndarray]:
+        if self.done:
+            return None
+        remaining = self.length - self.pos
+        if remaining <= 0:
+            self.done = True
+            return None
+
+        n = int(min(t_idx.size, remaining))
+        tt = t_idx[:n]
+        inc = (2.0 * np.pi * self.freqs) / float(self.sample_rate)
+        phases = self.phases[:, None] + inc[:, None] * tt[None, :]
+        wave = np.sin(phases).sum(axis=0) / max(1.0, float(self.freqs.size))
+
+        s = (self.pos + tt).astype(np.float64)
+        env_attack = np.clip(s / float(self.attack), 0.0, 1.0)
+        env_decay = np.exp(-s / float(self.decay))
+        env = env_attack * env_decay
+
+        # update phase + pos
+        self.phases = (self.phases + inc * float(n)) % (2.0 * np.pi)
+        self.pos += n
+        if self.pos >= self.length:
+            self.done = True
+        # pad if block longer than remaining
+        if n < t_idx.size:
+            out = np.zeros((t_idx.size,), dtype=np.float64)
+            out[:n] = wave * env
+            return out
+        return wave * env
 
 ASCII_LOGO = [
                                                               
@@ -221,6 +313,68 @@ def _left_hand(hands: List[HandPosition]) -> Optional[HandPosition]:
             return h
     # no fallback; left-hand control is optional
     return None
+
+
+def _midi_to_hz(midi: int) -> float:
+    return 440.0 * (2.0 ** ((float(midi) - 69.0) / 12.0))
+
+
+def _degree_chords(mode: str) -> List[Tuple[str, str, List[int]]]:
+    """
+    Returns 7 diatonic triads as (roman, label, midi_notes).
+
+    - Major => C major (C D E F G A B)
+    - Minor => A minor with V as E major (as requested)
+    """
+
+    m = (mode or "").lower()
+
+    if m == "minor":
+        # A minor: i, ii°, III, iv, V (E major), VI, VII
+        roots = [57, 59, 60, 62, 64, 65, 67]  # A3..G4
+        qualities = ["min", "dim", "maj", "min", "maj", "maj", "maj"]
+        romans = ["i", "ii°", "III", "iv", "V", "VI", "VII"]
+        labels = ["Am", "Bdim", "C", "Dm", "E", "F", "G"]
+    else:
+        # C major: I, ii, iii, IV, V, vi, vii°
+        roots = [60, 62, 64, 65, 67, 69, 59]  # keep Bdim lower (B3)
+        qualities = ["maj", "min", "min", "maj", "maj", "min", "dim"]
+        romans = ["I", "ii", "iii", "IV", "V", "vi", "vii°"]
+        labels = ["C", "Dm", "Em", "F", "G", "Am", "Bdim"]
+
+    out: List[Tuple[str, str, List[int]]] = []
+    for root, q, rn, lb in zip(roots, qualities, romans, labels):
+        if q == "maj":
+            notes = [root, root + 4, root + 7]
+        elif q == "min":
+            notes = [root, root + 3, root + 7]
+        else:  # dim
+            notes = [root, root + 3, root + 6]
+        out.append((rn, lb, notes))
+    return out
+
+
+def _draw_chord_ruler(frame, rect, chords: List[Tuple[str, str, List[int]]], selected_idx: int) -> None:
+    x0, y0, x1, y1 = rect
+    _draw_rect_alpha(frame, rect, (18, 18, 18), alpha=0.55)
+    cv2.rectangle(frame, (x0, y0), (x1, y1), (80, 80, 80), 2)
+    cv2.putText(frame, "CHORDS", (x0 + 10, y0 + 26), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2, cv2.LINE_AA)
+
+    inner_y0 = y0 + 40
+    inner_h = max(1, (y1 - inner_y0 - 10))
+    seg_h = inner_h / max(1, len(chords))
+
+    for i, (rn, lb, _notes) in enumerate(chords):
+        yy0 = int(inner_y0 + i * seg_h)
+        yy1 = int(inner_y0 + (i + 1) * seg_h)
+        if i == selected_idx:
+            _draw_rect_alpha(frame, (x0 + 6, yy0 + 2, x1 - 6, yy1 - 2), (40, 255, 120), alpha=0.72)
+            col = (10, 10, 10)
+        else:
+            col = (235, 235, 235)
+
+        cv2.putText(frame, rn, (x0 + 10, yy0 + 22), cv2.FONT_HERSHEY_SIMPLEX, 0.55, col, 2, cv2.LINE_AA)
+        cv2.putText(frame, lb, (x0 + 58, yy0 + 22), cv2.FONT_HERSHEY_SIMPLEX, 0.65, col, 2, cv2.LINE_AA)
 
 
 def _hand_lr_label(hand: HandPosition) -> str:
@@ -779,6 +933,7 @@ def main() -> int:
     active_panel = "bpm"  # or "mode"
     dir_gate = DirectionGate()
     left_dir_gate = DirectionGate()
+    left_fist_gate = BoolEdgeGate()
     last_t = time.time()
     fps = 0.0
     particles: List[Particle] = []
@@ -1043,6 +1198,20 @@ def main() -> int:
                 instr_rect = (pad, top, pad + int(W * 0.22), bottom)
                 _draw_instrument_panel(display, instr_rect, instruments, selected_idx=instrument_idx)
 
+                # Chord ruler (Keys only): to the left of the right info panel
+                chords = _degree_chords(mode)
+                chord_w = int(max(140, W * 0.14))
+                chord_rect = (info_rect[0] - pad - chord_w, top, info_rect[0] - pad, bottom)
+                chord_idx = 0
+                if rh is not None:
+                    cy = rh.center_px[1]
+                    inner_y0 = chord_rect[1] + 44
+                    inner_y1 = chord_rect[3] - 10
+                    t = float(np.clip((cy - inner_y0) / max(1.0, (inner_y1 - inner_y0)), 0.0, 0.999))
+                    chord_idx = int(t * 7)
+                if instrument_idx == 0:
+                    _draw_chord_ruler(display, chord_rect, chords, chord_idx)
+
                 # Left hand controls instrument selection (point UP/DOWN)
                 if lh is not None:
                     ldir = _point_direction(lh)
@@ -1055,6 +1224,17 @@ def main() -> int:
                     left_dir_gate.last_dir = None
                     left_dir_gate.stable_count = 0
                     left_dir_gate.armed = True
+
+                # Keys chord trigger: left hand closes -> play selected chord (loop only)
+                if instrument_idx == 0 and state == "loop" and lh is not None and KEYS_ENABLED:
+                    left_closed = _hand_openness_score(lh) <= 0.06
+                    if left_fist_gate.rising_edge(left_closed, cooldown_s=0.18):
+                        _, _lb, midi_notes = chords[chord_idx]
+                        freqs = [_midi_to_hz(m) for m in midi_notes]
+                        if metro_running:
+                            metro.play_chord(freqs)
+                else:
+                    left_fist_gate.prev = False
 
                 # Keep the middle empty; status goes into the PROJECT panel on the right.
                 extra: List[Tuple[str, str]] = []
