@@ -10,6 +10,7 @@ from typing import List, Optional, Tuple
 
 import cv2
 import numpy as np
+import sounddevice as sd
 
 # Allow running without installing the package (repo-local usage).
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
@@ -28,6 +29,107 @@ PROCEED_COOLDOWN_S = 1
 # Proceed based on openness being ~0 for both hands.
 # If your openness is truly exactly 0.00 when clenched, you can set this to 0.0.
 PROCEED_OPENNESS_MAX = 0.03
+
+# --- Metronome tuning knobs ---
+METRONOME_ENABLED = True
+METRONOME_BEAT_VOLUME = 0.045  # 0..1 (beats 2/3/4)
+METRONOME_DOWNBEAT_VOLUME = 0.075  # 0..1 (beat 1)
+METRONOME_CLICK_HZ = 1100.0
+METRONOME_DOWNBEAT_HZ = 750.0
+METRONOME_CLICK_MS = 28.0
+
+
+class Metronome:
+    def __init__(self, sample_rate: int = 48000, channels: int = 2) -> None:
+        self.sample_rate = sample_rate
+        self.channels = channels
+        self._bpm = 120.0
+        self._beat_samples = int(self.sample_rate * 60.0 / self._bpm)
+        self._sample_index = 0
+        self._next_click_sample = 0
+        self._stream: Optional[sd.OutputStream] = None
+
+        n = max(1, int(self.sample_rate * (METRONOME_CLICK_MS / 1000.0)))
+        t = np.arange(n, dtype=np.float32) / float(self.sample_rate)
+        env = np.exp(-t * 45.0).astype(np.float32)
+        click = (np.sin(2.0 * np.pi * float(METRONOME_CLICK_HZ) * t) * env).astype(np.float32)
+        down = (np.sin(2.0 * np.pi * float(METRONOME_DOWNBEAT_HZ) * t) * env).astype(np.float32)
+        self._click = click
+        self._down = down
+
+    def set_bpm(self, bpm: int) -> None:
+        bpm = int(max(30, min(300, bpm)))
+        self._bpm = float(bpm)
+        self._beat_samples = max(1, int(self.sample_rate * 60.0 / self._bpm))
+
+    def reset_phase(self) -> None:
+        """Reset beat grid so beat 1 happens immediately."""
+        self._sample_index = 0
+        self._next_click_sample = 0
+
+    def start(self) -> None:
+        if self._stream is not None:
+            return
+        self.reset_phase()
+        self._stream = sd.OutputStream(
+            samplerate=self.sample_rate,
+            channels=self.channels,
+            dtype="float32",
+            callback=self._callback,
+            blocksize=0,
+        )
+        self._stream.start()
+
+    def stop(self) -> None:
+        if self._stream is None:
+            return
+        try:
+            self._stream.stop()
+            self._stream.close()
+        finally:
+            self._stream = None
+
+    def _callback(self, outdata, frames, time_info, status) -> None:
+        out = np.zeros((frames, self.channels), dtype=np.float32)
+
+        if METRONOME_ENABLED and (METRONOME_BEAT_VOLUME > 0 or METRONOME_DOWNBEAT_VOLUME > 0):
+            start = self._sample_index
+            end = self._sample_index + frames
+            while self._next_click_sample < end:
+                off = int(self._next_click_sample - start)
+                if off < 0:
+                    self._next_click_sample += self._beat_samples
+                    continue
+                beat_idx = 0
+                if self._beat_samples > 0:
+                    beat_idx = int(self._next_click_sample // self._beat_samples)
+                is_downbeat = (beat_idx % 4) == 0
+                vol = float(METRONOME_DOWNBEAT_VOLUME if is_downbeat else METRONOME_BEAT_VOLUME)
+                wave = self._down if is_downbeat else self._click
+                n = min(len(self._click), frames - off)
+                if n > 0:
+                    out[off : off + n, 0] += wave[:n] * vol
+                    if self.channels > 1:
+                        out[off : off + n, 1] += wave[:n] * vol
+                self._next_click_sample += self._beat_samples
+
+        outdata[:] = out
+        self._sample_index += frames
+
+    def beat_in_bar(self) -> int:
+        # Based on sample counter: 1..4 looping
+        b = self.beats_elapsed()
+        return (b % 4) + 1
+
+    def beats_elapsed(self) -> int:
+        if self._beat_samples <= 0:
+            return 0
+        return int(self._sample_index // self._beat_samples)
+
+    def bar_in_loop(self, bars_per_loop: int = 8) -> int:
+        # 1..bars_per_loop looping
+        b = self.beats_elapsed()
+        return ((b // 4) % max(1, bars_per_loop)) + 1
 
 ASCII_LOGO = [
                                                               
@@ -111,6 +213,14 @@ def _right_hand(hands: List[HandPosition]) -> Optional[HandPosition]:
         if (h.handedness_label or "").lower() == "right":
             return h
     return hands[0] if hands else None
+
+
+def _left_hand(hands: List[HandPosition]) -> Optional[HandPosition]:
+    for h in hands:
+        if (h.handedness_label or "").lower() == "left":
+            return h
+    # no fallback; left-hand control is optional
+    return None
 
 
 def _hand_lr_label(hand: HandPosition) -> str:
@@ -668,6 +778,7 @@ def main() -> int:
 
     active_panel = "bpm"  # or "mode"
     dir_gate = DirectionGate()
+    left_dir_gate = DirectionGate()
     last_t = time.time()
     fps = 0.0
     particles: List[Particle] = []
@@ -679,6 +790,10 @@ def main() -> int:
     loop_start_t: Optional[float] = None
     instruments = ["keys", "bass", "kit", "lead"]
     instrument_idx = 0
+
+    metro = Metronome(sample_rate=48000, channels=2)
+    metro_running = False
+    prev_state: Optional[str] = None
 
     with HandPositionDetector(max_num_hands=2, tasks_model_path=args.tasks_model) as detector:
         while True:
@@ -697,8 +812,9 @@ def main() -> int:
                 display = frame
                 hands = hands_raw
 
-            # Choose the right hand for control (but render both hands).
+            # Choose control hands (right hand drives setup; left hand will drive instrument selection).
             rh = _right_hand(hands)
+            lh = _left_hand(hands)
 
             # Update fps
             now = time.time()
@@ -722,6 +838,30 @@ def main() -> int:
 
             bpm = bpm_values[bpm_idx]
             mode = mode_items[mode_idx]
+
+            # Start metronome ONLY for countdown/loop, and keep UI in sync with the audio clock.
+            if METRONOME_ENABLED:
+                if state in ("countdown", "loop"):
+                    if not metro_running:
+                        metro.set_bpm(bpm)
+                        metro.start()
+                        metro_running = True
+                    else:
+                        # bpm shouldn't change here, but keep it synced just in case
+                        metro.set_bpm(bpm)
+                else:
+                    if metro_running:
+                        metro.stop()
+                        metro_running = False
+            else:
+                if metro_running:
+                    metro.stop()
+                    metro_running = False
+
+            # Reset phase on entering countdown OR loop (so both start at bar1/beat1)
+            if METRONOME_ENABLED and metro_running and (prev_state != state) and (state in ("countdown", "loop")):
+                metro.set_bpm(bpm)
+                metro.reset_phase()
 
             # Identify labeled hands early (used for proceed + debug).
             l_hand = next((h for h in hands if (h.handedness_label or "").lower() == "left"), None)
@@ -894,23 +1034,36 @@ def main() -> int:
 
                 if did_proceed:
                     state = "countdown"
-                    countdown_start_t = time.time()
-                    loop_start_t = None
+                    # Ensure countdown starts at Beat 1 (audio/UI share this clock).
+                    if METRONOME_ENABLED:
+                        metro.reset_phase()
                     proceed_hold.reset()
             else:
                 # Left instruments panel (semi-transparent)
                 instr_rect = (pad, top, pad + int(W * 0.22), bottom)
                 _draw_instrument_panel(display, instr_rect, instruments, selected_idx=instrument_idx)
 
+                # Left hand controls instrument selection (point UP/DOWN)
+                if lh is not None:
+                    ldir = _point_direction(lh)
+                    ltrig = left_dir_gate.update_and_trigger(ldir, stable_frames=3, cooldown_s=0.35)
+                    if ltrig == "up":
+                        instrument_idx = int(np.clip(instrument_idx - 1, 0, len(instruments) - 1))
+                    elif ltrig == "down":
+                        instrument_idx = int(np.clip(instrument_idx + 1, 0, len(instruments) - 1))
+                else:
+                    left_dir_gate.last_dir = None
+                    left_dir_gate.stable_count = 0
+                    left_dir_gate.armed = True
+
                 # Keep the middle empty; status goes into the PROJECT panel on the right.
                 extra: List[Tuple[str, str]] = []
                 if state == "countdown":
                     # 2 bars in 4/4 => 8 beats
-                    total_beats = 8.0
-                    elapsed = 0.0 if countdown_start_t is None else (time.time() - countdown_start_t)
-                    beat_dur = 60.0 / float(max(1, bpm))
-                    beats_left = max(0.0, total_beats - (elapsed / beat_dur))
-                    big_n = int(max(1.0, np.ceil(beats_left)))
+                    total_beats = 8
+                    beats_elapsed = metro.beats_elapsed() if metro_running else 0
+                    beats_left = max(0, total_beats - beats_elapsed)
+                    big_n = max(1, beats_left)
 
                     # Big centered countdown number (no middle panel)
                     big = str(big_n)
@@ -922,8 +1075,9 @@ def main() -> int:
                     extra.extend(
                         [
                             ("State", "countdown"),
-                            ("Beats", f"{big_n}"),
-                            ("Bars", f"{(beats_left / 4.0):0.1f}"),
+                            ("Count", f"{big_n}"),
+                            ("Bar", "0"),
+                            ("Beat", str(metro.beat_in_bar())),
                             ("Hands", str(len(hands))),
                             ("2Fists", "yes" if two_fists else "no"),
                             ("L_fist", "yes" if l_fist else "no"),
@@ -939,22 +1093,23 @@ def main() -> int:
                     )
 
                     if did_proceed:
-                        beats_left = 0.0
+                        beats_left = 0
 
-                    if beats_left <= 0.0:
+                    if beats_left <= 0:
+                        # Reset before entering loop so loop always starts at Bar 1 / Beat 1.
+                        if METRONOME_ENABLED:
+                            metro.reset_phase()
                         state = "loop"
-                        loop_start_t = time.time()
                         proceed_hold.reset()
                 else:
-                    # loop state (placeholder)
-                    total_bars = 8.0
-                    elapsed = 0.0 if loop_start_t is None else (time.time() - loop_start_t)
-                    bar_dur = (60.0 / float(max(1, bpm))) * 4.0  # 4 beats per bar
-                    bars = min(total_bars, elapsed / bar_dur)
+                    # loop state (bar/beat derived from metronome clock)
+                    bar = metro.bar_in_loop(8) if metro_running else 1
+                    beat = metro.beat_in_bar() if metro_running else 1
                     extra.extend(
                         [
                             ("State", "loop1"),
-                            ("Bars", f"{bars:0.1f}/{total_bars:0.0f}"),
+                            ("Bar", str(bar)),
+                            ("Beat", str(beat)),
                             ("Hands", str(len(hands))),
                             ("2Fists", "yes" if two_fists else "no"),
                             ("L_fist", "yes" if l_fist else "no"),
@@ -1006,8 +1161,11 @@ def main() -> int:
             if key in (ord("q"), 27):
                 break
 
+            prev_state = state
+
     cap.release()
     cv2.destroyAllWindows()
+    metro.stop()
     return 0
 
 
