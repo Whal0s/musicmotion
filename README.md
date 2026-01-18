@@ -38,6 +38,12 @@ python3 scripts/retro_ui_demo.py
 Controls:
 - `q`: quit
 
+### Title screen (hand-controlled BPM + key mode)
+
+```bash
+python3 scripts/title_screen.py
+```
+
 ### Troubleshooting
 
 - **`source: no such file or directory: .venv/bin/activate`**: you haven’t created the venv yet. Run:
