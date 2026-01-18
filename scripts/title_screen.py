@@ -66,7 +66,7 @@ BASS_DRIVE = 1.25  # >1 adds saturation
 
 # --- Lead synth knobs ---
 LEAD_ENABLED = True
-LEAD_VOLUME = 0.14  # 0..1
+LEAD_VOLUME = 0.04  # 0..1
 LEAD_ATTACK_MS = 3.0
 LEAD_DECAY_MS = 860.0
 LEAD_DURATION_MS = 380.0
