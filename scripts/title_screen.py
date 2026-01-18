@@ -934,7 +934,7 @@ def main() -> int:
 
     # State
     bpm_values = list(range(60, 181, 5))
-    bpm_idx = bpm_values.index(120) if 120 in bpm_values else 0
+    bpm_idx = bpm_values.index(80) if 80 in bpm_values else 0
     mode_items = ["Major", "Minor"]
     mode_idx = 0
 
