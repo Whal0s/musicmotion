@@ -21,12 +21,21 @@ from musicmotion_hand.detector import HandPositionDetector  # noqa: E402
 from musicmotion_hand.types import HandLandmark, HandPosition  # noqa: E402
 
 
+# --- Tuning knobs (edit these to tweak "two fists" recognition) ---
+FIST_SCORE_THRESHOLD = 0.5  # higher = stricter
+PROCEED_HOLD_S = 0.2
+PROCEED_COOLDOWN_S = 1
+# Proceed based on openness being ~0 for both hands.
+# If your openness is truly exactly 0.00 when clenched, you can set this to 0.0.
+PROCEED_OPENNESS_MAX = 0.03
+
 ASCII_LOGO = [
-    r"                  _                            _   _           ",
-    r" _ __ ___  _   _ | | ___  _ __ ___   ___  ___ | |_(_) ___  _ __ ",
-    r"| '_ ` _ \| | | || |/ __|| '_ ` _ \ / _ \/ __|| __| |/ _ \| '_ \\",
-    r"| | | | | | |_| || |\__ \| | | | | | (_) \__ \| |_| | (_) | | | |",
-    r"|_| |_| |_|\__,_||_||___/|_| |_| |_|\___/|___/ \__|_|\___/|_| |_|",
+                                                              
+    r"                     _                      _   _             ",
+    r" _ __ ___  _   _ ___(_) ___ _ __ ___   ___ | |_(_) ___  _ __  ",
+    r"| '_ ` _ \| | | / __| |/ __| '_ ` _ \ / _ \| __| |/ _ \| '_ \ ",
+    r"| | | | | | |_| \__ \ | (__| | | | | | (_) | |_| | (_) | | | |",
+    r"|_| |_| |_|\__,_|___/_|\___|_| |_| |_|\___/ \__|_|\___/|_| |_|",
 ]
 
 
@@ -122,8 +131,10 @@ def _hand_openness_score(hand: HandPosition) -> float:
     lms = hand.landmarks
     if len(lms) < 21:
         return 1.0
-    x0, y0, x1, y1 = hand.bbox_px
-    diag = max(1.0, float(((x1 - x0) ** 2 + (y1 - y0) ** 2) ** 0.5))
+    # Use a stable scale: palm length (wrist -> middle MCP). This is much less sensitive than bbox size.
+    wrist = (lms[0].x_px, lms[0].y_px)
+    palm = (lms[9].x_px, lms[9].y_px)
+    palm_len = max(1.0, _dist(wrist, palm))
 
     pairs = [
         (8, 5),  # index tip -> index mcp
@@ -138,11 +149,26 @@ def _hand_openness_score(hand: HandPosition) -> float:
         dy = float(lms[a].y_px - lms[b].y_px)
         dsum += (dx * dx + dy * dy) ** 0.5
     davg = dsum / len(pairs)
-    norm = davg / diag
+    norm = davg / palm_len
 
     # Map a rough range into 0..1 for easier thresholds.
-    # Typical: closed ~0.10-0.25, open ~0.40-0.70 (varies).
-    return float(np.clip((norm - 0.18) / (0.55 - 0.18), 0.0, 1.0))
+    # With palm normalization, typical ranges are closer to:
+    # - closed: ~0.35-0.65
+    # - open:   ~0.80-1.40 (varies by angle)
+    return float(np.clip((norm - 0.55) / (1.25 - 0.55), 0.0, 1.0))
+
+
+def _fist_score(*, openness: float, tip_norm: float) -> float:
+    """
+    Convert raw measurements into a 0..1 closedness score (higher = more closed).
+
+    NOTE: openness can be imperfect depending on angle, so we weight fingertip proximity more.
+    """
+
+    closed_from_open = 1.0 - float(np.clip(openness, 0.0, 1.0))
+    # tip_norm: smaller means tips closer to palm (more closed)
+    closed_from_tip = 1.0 - float(np.clip((tip_norm - 0.45) / (1.10 - 0.45), 0.0, 1.0))
+    return float(np.clip(0.20 * closed_from_open + 0.80 * closed_from_tip, 0.0, 1.0))
 
 
 @dataclass
@@ -197,6 +223,37 @@ class BoolEdgeGate:
             fired = True
         self.prev = curr
         return fired
+
+
+@dataclass
+class HoldGate:
+    """
+    Fires when `cond` has been true continuously for `hold_s`,
+    with a cooldown to prevent repeats while still holding.
+    """
+
+    hold_start_t: Optional[float] = None
+    last_fire_t: float = 0.0
+
+    def reset(self) -> None:
+        self.hold_start_t = None
+
+    def update(self, cond: bool, *, hold_s: float, cooldown_s: float) -> bool:
+        now = time.time()
+        if not cond:
+            self.hold_start_t = None
+            return False
+
+        if self.hold_start_t is None:
+            self.hold_start_t = now
+            return False
+
+        if (now - self.hold_start_t) >= hold_s and (now - self.last_fire_t) >= cooldown_s:
+            self.last_fire_t = now
+            # keep hold_start_t so holding continues, but cooldown prevents spam
+            return True
+
+        return False
 
 
 HAND_CONNECTIONS: List[Tuple[int, int]] = [
@@ -313,6 +370,27 @@ def _draw_hand_label(frame, hand: HandPosition) -> None:
     cv2.putText(frame, label, (org[0] + 2, org[1] + 2), cv2.FONT_HERSHEY_SIMPLEX, 1.1, (0, 0, 0), 5, cv2.LINE_AA)
     cv2.putText(frame, label, org, cv2.FONT_HERSHEY_SIMPLEX, 1.1, (255, 255, 255), 3, cv2.LINE_AA)
 
+    # Closedness strength label (for tuning)
+    try:
+        if len(hand.landmarks) < 21:
+            return
+        openness = _hand_openness_score(hand)
+        wrist = (hand.landmarks[0].x_px, hand.landmarks[0].y_px)
+        palm = (hand.landmarks[9].x_px, hand.landmarks[9].y_px)
+        palm_len = max(1.0, _dist(wrist, palm))
+        cx, cy = hand.center_px
+        tip_idxs = [4, 8, 12, 16, 20]
+        dsum = 0.0
+        for i in tip_idxs:
+            dsum += _dist((hand.landmarks[i].x_px, hand.landmarks[i].y_px), (cx, cy))
+        tip_norm = (dsum / len(tip_idxs)) / palm_len
+        score = _fist_score(openness=openness, tip_norm=tip_norm)
+        txt = f"C:{score:0.2f}  o:{openness:0.2f}  t:{tip_norm:0.2f}"
+        cv2.putText(frame, txt, (org[0] + 26, org[1] + 2), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 0, 0), 4, cv2.LINE_AA)
+        cv2.putText(frame, txt, (org[0] + 24, org[1]), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 2, cv2.LINE_AA)
+    except Exception:
+        pass
+
 
 def _point_direction(hand: HandPosition) -> Optional[str]:
     """
@@ -377,14 +455,40 @@ def _all_fingers_closed(hand: HandPosition) -> bool:
         # tip should not extend beyond MCP by more than small slack
         return d_tip <= d_mcp + slack * diag
 
-    # Tuned slack values: forgiving but prevents "index up" from counting as closed.
+    # Tuned slack values: more forgiving in practice (camera angle varies a lot).
     return (
-        folded(4, 2, 0.02)  # thumb tip vs thumb MCP-ish
-        and folded(8, 5, 0.01)  # index
-        and folded(12, 9, 0.01)  # middle
-        and folded(16, 13, 0.01)  # ring
-        and folded(20, 17, 0.01)  # pinky
+        folded(4, 2, 0.06)  # thumb tip vs thumb MCP-ish
+        and folded(8, 5, 0.05)  # index
+        and folded(12, 9, 0.05)  # middle
+        and folded(16, 13, 0.05)  # ring
+        and folded(20, 17, 0.05)  # pinky
     )
+
+
+def _is_fist(hand: HandPosition) -> bool:
+    """
+    Practical fist detector (less finicky than per-finger checks):
+    - low overall openness
+    - fingertips close to palm center
+    """
+
+    if len(hand.landmarks) < 21:
+        return False
+
+    openness = _hand_openness_score(hand)
+    wrist = (hand.landmarks[0].x_px, hand.landmarks[0].y_px)
+    palm = (hand.landmarks[9].x_px, hand.landmarks[9].y_px)
+    palm_len = max(1.0, _dist(wrist, palm))
+    cx, cy = hand.center_px
+
+    tip_idxs = [4, 8, 12, 16, 20]
+    dsum = 0.0
+    for i in tip_idxs:
+        dsum += _dist((hand.landmarks[i].x_px, hand.landmarks[i].y_px), (cx, cy))
+    avg_tip = dsum / len(tip_idxs)
+    tip_norm = avg_tip / palm_len
+
+    return _fist_score(openness=openness, tip_norm=tip_norm) >= FIST_SCORE_THRESHOLD
 
 
 def _two_fists_closed(hands: List[HandPosition]) -> bool:
@@ -406,15 +510,27 @@ def _two_fists_closed(hands: List[HandPosition]) -> bool:
             right = h
 
     if left is not None and right is not None:
-        return _all_fingers_closed(left) and _all_fingers_closed(right)
+        return _is_fist(left) and _is_fist(right)
 
-    closed = 0
+    # Otherwise: compute scores for all hands and require the top 2 to clear the threshold.
+    scores: List[float] = []
     for h in hands:
-        if _all_fingers_closed(h):
-            closed += 1
-        if closed >= 2:
-            return True
-    return False
+        if len(h.landmarks) < 21:
+            continue
+        o = _hand_openness_score(h)
+        wrist = (h.landmarks[0].x_px, h.landmarks[0].y_px)
+        palm = (h.landmarks[9].x_px, h.landmarks[9].y_px)
+        palm_len = max(1.0, _dist(wrist, palm))
+        cx, cy = h.center_px
+        tip_idxs = [4, 8, 12, 16, 20]
+        dsum = 0.0
+        for i in tip_idxs:
+            dsum += _dist((h.landmarks[i].x_px, h.landmarks[i].y_px), (cx, cy))
+        tip_norm = (dsum / len(tip_idxs)) / palm_len
+        scores.append(_fist_score(openness=o, tip_norm=tip_norm))
+
+    scores.sort(reverse=True)
+    return len(scores) >= 2 and scores[0] >= FIST_SCORE_THRESHOLD and scores[1] >= FIST_SCORE_THRESHOLD
 
 
 def _draw_rect_alpha(frame, rect, color_bgr, alpha: float) -> None:
@@ -555,9 +671,10 @@ def main() -> int:
     last_t = time.time()
     fps = 0.0
     particles: List[Particle] = []
-    fist_gate = BoolEdgeGate()
+    proceed_hold = HoldGate()
 
-    state: str = "title"  # title -> countdown -> loop
+    state: str = "welcome"  # welcome -> title -> countdown -> loop
+    welcome_start_t: float = time.time()
     countdown_start_t: Optional[float] = None
     loop_start_t: Optional[float] = None
     instruments = ["keys", "bass", "kit", "lead"]
@@ -606,6 +723,61 @@ def main() -> int:
             bpm = bpm_values[bpm_idx]
             mode = mode_items[mode_idx]
 
+            # Identify labeled hands early (used for proceed + debug).
+            l_hand = next((h for h in hands if (h.handedness_label or "").lower() == "left"), None)
+            r_hand = next((h for h in hands if (h.handedness_label or "").lower() == "right"), None)
+
+            # Proceed condition: BOTH hands (L+R) present and both openness ~ 0.
+            # This matches the UI debug values (L_open/R_open).
+            two_fists = False
+            if l_hand is not None and r_hand is not None:
+                try:
+                    l_open_val = float(_hand_openness_score(l_hand))
+                    r_open_val = float(_hand_openness_score(r_hand))
+                    two_fists = (l_open_val <= PROCEED_OPENNESS_MAX) and (r_open_val <= PROCEED_OPENNESS_MAX)
+                except Exception:
+                    two_fists = False
+
+            did_proceed = proceed_hold.update(two_fists, hold_s=PROCEED_HOLD_S, cooldown_s=PROCEED_COOLDOWN_S)
+            # Debug for fist detection
+            l_fist = _is_fist(l_hand) if l_hand is not None else False
+            r_fist = _is_fist(r_hand) if r_hand is not None else False
+            l_open = f"{_hand_openness_score(l_hand):0.2f}" if l_hand is not None else "-"
+            r_open = f"{_hand_openness_score(r_hand):0.2f}" if r_hand is not None else "-"
+            # raw-ish fist helper (tip distance / palm length), helpful for tuning
+            def _tip_norm(h: Optional[HandPosition]) -> str:
+                if h is None or len(h.landmarks) < 21:
+                    return "-"
+                wrist = (h.landmarks[0].x_px, h.landmarks[0].y_px)
+                palm = (h.landmarks[9].x_px, h.landmarks[9].y_px)
+                palm_len = max(1.0, _dist(wrist, palm))
+                cx, cy = h.center_px
+                tip_idxs = [4, 8, 12, 16, 20]
+                dsum = 0.0
+                for i in tip_idxs:
+                    dsum += _dist((h.landmarks[i].x_px, h.landmarks[i].y_px), (cx, cy))
+                return f"{(dsum / len(tip_idxs)) / palm_len:0.2f}"
+            l_tip = _tip_norm(l_hand)
+            r_tip = _tip_norm(r_hand)
+
+            def _score_norm(h: Optional[HandPosition]) -> str:
+                if h is None or len(h.landmarks) < 21:
+                    return "-"
+                o = _hand_openness_score(h)
+                wrist = (h.landmarks[0].x_px, h.landmarks[0].y_px)
+                palm = (h.landmarks[9].x_px, h.landmarks[9].y_px)
+                palm_len = max(1.0, _dist(wrist, palm))
+                cx, cy = h.center_px
+                tip_idxs = [4, 8, 12, 16, 20]
+                dsum = 0.0
+                for i in tip_idxs:
+                    dsum += _dist((h.landmarks[i].x_px, h.landmarks[i].y_px), (cx, cy))
+                tip_norm = (dsum / len(tip_idxs)) / palm_len
+                return f"{_fist_score(openness=o, tip_norm=tip_norm):0.2f}"
+
+            l_score = _score_norm(l_hand)
+            r_score = _score_norm(r_hand)
+
             # Controls (right hand):
             # - point LEFT/RIGHT: choose active control (BPM vs KEY MODE)
             # - point UP/DOWN: adjust the active control
@@ -641,37 +813,90 @@ def main() -> int:
                         else:
                             mode_idx = 1  # Minor
 
-                # Fist to go next
-                is_fist = _all_fingers_closed(rh)
-                if fist_gate.rising_edge(is_fist, cooldown_s=1.0):
-                    if state == "title":
-                        state = "countdown"
-                        countdown_start_t = time.time()
-                        loop_start_t = None
-                    elif state == "countdown":
-                        # allow skipping countdown if desired
-                        state = "loop"
-                        loop_start_t = time.time()
-                    elif state == "loop":
-                        # placeholder: return to title
-                        state = "title"
-                        countdown_start_t = None
-                        loop_start_t = None
-
             else:
                 dir_gate.last_dir = None
                 dir_gate.stable_count = 0
                 dir_gate.armed = True
-                fist_gate.prev = False
+                proceed_hold.reset()
 
             _update_and_draw_particles(display, particles, dt=dt)
 
             # Render UI by state
-            if state == "title":
+            if state == "welcome":
+                _draw_rect_alpha(display, (0, 0, W, H), (0, 0, 0), alpha=0.35)
+
+                t = time.time() - welcome_start_t
+                logo_alpha = float(np.clip(t / 2.2, 0.0, 1.0))
+                text_alpha = float(np.clip((t - 1.2) / 1.6, 0.0, 1.0))
+
+                logo_h = min(240, max(140, int(H * 0.26)))
+                logo = np.zeros((logo_h, W, 3), dtype=np.uint8)
+                draw_ascii_banner(logo)
+                _blend_image_alpha(display, logo, 0, int(H * 0.10), alpha=logo_alpha)
+
+                prompt = "MAKE TWO FISTS TO PROCEED"
+                (tw, _), _b = cv2.getTextSize(prompt, cv2.FONT_HERSHEY_SIMPLEX, 1.0, 3)
+                px = max(20, (W - tw) // 2)
+                py = int(H * 0.58)
+                col = int(255 * text_alpha)
+                cv2.putText(display, prompt, (px + 2, py + 2), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 0), 6, cv2.LINE_AA)
+                cv2.putText(display, prompt, (px, py), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (col, col, col), 3, cv2.LINE_AA)
+
+                _draw_info_panel(
+                    display,
+                    info_rect,
+                    bpm=bpm,
+                    mode=mode,
+                    extra_lines=[
+                        ("State", "welcome"),
+                        ("Hands", str(len(hands))),
+                        ("2Fists", "yes" if two_fists else "no"),
+                        ("L_fist", "yes" if l_fist else "no"),
+                        ("R_fist", "yes" if r_fist else "no"),
+                        ("L_open", l_open),
+                        ("R_open", r_open),
+                        ("L_tip", l_tip),
+                        ("R_tip", r_tip),
+                        ("L_C", l_score),
+                        ("R_C", r_score),
+                        ("Thres", f"{FIST_SCORE_THRESHOLD:0.2f}"),
+                    ],
+                )
+
+                if did_proceed:
+                    state = "title"
+                    proceed_hold.reset()
+
+            elif state == "title":
                 bpm_items = [f"{b} BPM" for b in bpm_values]
                 _draw_panel(display, bpm_rect, "BPM", active_panel == "bpm", bpm_idx, bpm_items)
                 _draw_panel(display, mode_rect, "KEY MODE", active_panel == "mode", mode_idx, mode_items)
-                _draw_info_panel(display, info_rect, bpm=bpm, mode=mode, extra_lines=[("State", "setup")])
+                _draw_info_panel(
+                    display,
+                    info_rect,
+                    bpm=bpm,
+                    mode=mode,
+                    extra_lines=[
+                        ("State", "setup"),
+                        ("Hands", str(len(hands))),
+                        ("2Fists", "yes" if two_fists else "no"),
+                        ("L_fist", "yes" if l_fist else "no"),
+                        ("R_fist", "yes" if r_fist else "no"),
+                        ("L_open", l_open),
+                        ("R_open", r_open),
+                        ("L_tip", l_tip),
+                        ("R_tip", r_tip),
+                        ("L_C", l_score),
+                        ("R_C", r_score),
+                        ("Thres", f"{FIST_SCORE_THRESHOLD:0.2f}"),
+                    ],
+                )
+
+                if did_proceed:
+                    state = "countdown"
+                    countdown_start_t = time.time()
+                    loop_start_t = None
+                    proceed_hold.reset()
             else:
                 # Left instruments panel (semi-transparent)
                 instr_rect = (pad, top, pad + int(W * 0.22), bottom)
@@ -685,24 +910,64 @@ def main() -> int:
                     elapsed = 0.0 if countdown_start_t is None else (time.time() - countdown_start_t)
                     beat_dur = 60.0 / float(max(1, bpm))
                     beats_left = max(0.0, total_beats - (elapsed / beat_dur))
+                    big_n = int(max(1.0, np.ceil(beats_left)))
+
+                    # Big centered countdown number (no middle panel)
+                    big = str(big_n)
+                    (bw, _bh), _ = cv2.getTextSize(big, cv2.FONT_HERSHEY_SIMPLEX, 6.0, 12)
+                    cx = (W - bw) // 2
+                    cy = int(H * 0.52)
+                    cv2.putText(display, big, (cx + 6, cy + 6), cv2.FONT_HERSHEY_SIMPLEX, 6.0, (0, 0, 0), 18, cv2.LINE_AA)
+                    cv2.putText(display, big, (cx, cy), cv2.FONT_HERSHEY_SIMPLEX, 6.0, (255, 255, 255), 12, cv2.LINE_AA)
                     extra.extend(
                         [
                             ("State", "countdown"),
-                            ("Beats", f"{int(np.ceil(beats_left))}"),
+                            ("Beats", f"{big_n}"),
                             ("Bars", f"{(beats_left / 4.0):0.1f}"),
+                            ("Hands", str(len(hands))),
+                            ("2Fists", "yes" if two_fists else "no"),
+                            ("L_fist", "yes" if l_fist else "no"),
+                            ("R_fist", "yes" if r_fist else "no"),
+                            ("L_open", l_open),
+                            ("R_open", r_open),
+                            ("L_tip", l_tip),
+                            ("R_tip", r_tip),
+                            ("L_C", l_score),
+                            ("R_C", r_score),
+                            ("Thres", f"{FIST_SCORE_THRESHOLD:0.2f}"),
                         ]
                     )
+
+                    if did_proceed:
+                        beats_left = 0.0
 
                     if beats_left <= 0.0:
                         state = "loop"
                         loop_start_t = time.time()
+                        proceed_hold.reset()
                 else:
                     # loop state (placeholder)
                     total_bars = 8.0
                     elapsed = 0.0 if loop_start_t is None else (time.time() - loop_start_t)
                     bar_dur = (60.0 / float(max(1, bpm))) * 4.0  # 4 beats per bar
                     bars = min(total_bars, elapsed / bar_dur)
-                    extra.extend([("State", "loop1"), ("Bars", f"{bars:0.1f}/{total_bars:0.0f}")])
+                    extra.extend(
+                        [
+                            ("State", "loop1"),
+                            ("Bars", f"{bars:0.1f}/{total_bars:0.0f}"),
+                            ("Hands", str(len(hands))),
+                            ("2Fists", "yes" if two_fists else "no"),
+                            ("L_fist", "yes" if l_fist else "no"),
+                            ("R_fist", "yes" if r_fist else "no"),
+                            ("L_open", l_open),
+                            ("R_open", r_open),
+                            ("L_tip", l_tip),
+                            ("R_tip", r_tip),
+                            ("L_C", l_score),
+                            ("R_C", r_score),
+                            ("Thres", f"{FIST_SCORE_THRESHOLD:0.2f}"),
+                        ]
+                    )
 
                 _draw_info_panel(display, info_rect, bpm=bpm, mode=mode, extra_lines=extra)
 
@@ -713,7 +978,7 @@ def main() -> int:
             hud = banner.copy()
             cv2.putText(
                 hud,
-                "point LEFT/RIGHT: choose control | point UP/DOWN: adjust | FULL fist: continue | q/esc quit",
+                "point LEFT/RIGHT: choose control | point UP/DOWN: adjust | TWO fists (C>=thres): continue | q/esc quit",
                 (14, hud.shape[0] - 12),
                 cv2.FONT_HERSHEY_PLAIN,
                 1.2,
